@@ -8,6 +8,8 @@ Each capture now refreshes dependency downloads (cache disabled during capture) 
 
 Capture launches now use an isolated temporary Chromium profile per run to avoid `userDataDir` lock conflicts when multiple captures are started close together.
 
+For tunnel/proxy setups (such as ngrok), capture start requests now send `ngrok-skip-browser-warning: true` and the UI gracefully handles non-JSON HTML tunnel responses instead of crashing with `Unexpected token "<"`.
+
 ## How to Run
 
 1.  **Install Dependencies:**

@@ -309,10 +309,28 @@ app.get('/', (req, res) => {
                         // Send a non-blocking request to start capture
                         const response = await fetch('/capture-start', {
                             method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Accept': 'application/json',
+                                'ngrok-skip-browser-warning': 'true'
+                            },
                             body: JSON.stringify({ url })
                         });
-                        const result = await response.json();
+
+                        const responseText = await response.text();
+                        let result = null;
+                        try {
+                            result = JSON.parse(responseText);
+                        } catch (parseError) {
+                            const isHtml = responseText.trim().startsWith('<!doctype') || responseText.trim().startsWith('<html');
+                            if (isHtml) {
+                                status.innerText = "❌ Capture start was blocked by a proxy/tunnel HTML response. If using ngrok, open the tunnel URL once in browser or use ngrok-skip-browser-warning.";
+                            } else {
+                                status.innerText = "❌ Invalid server response while starting capture.";
+                            }
+                            return;
+                        }
+
                         if (result.status === 'started') {
                             status.innerText = "📡 Server is capturing...";
                             // Further updates will come via SSE
