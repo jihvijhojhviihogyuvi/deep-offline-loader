@@ -11,7 +11,7 @@ Capture launches now use an isolated temporary Chromium profile per run to avoid
 For tunnel/proxy setups (such as ngrok), capture start requests now send `ngrok-skip-browser-warning: true` and the UI gracefully handles non-JSON HTML tunnel responses instead of crashing with `Unexpected token "<"`.
 SSE responses now set anti-buffering headers and the UI safely ignores non-JSON SSE payloads, which improves reliability when traversing mobile proxies/tunnels.
 When a page is marked complete, the app now loads it through local `/view-site` rendering (instead of depending on huge HTML blobs in SSE), which is more tunnel-friendly on mobile.
-The frontend now falls back to `/events-poll` long-polling when SSE is blocked by a tunnel/proxy, so captures continue updating even when EventSource fails over ngrok/mobile networks.
+The frontend now falls back to `/events-poll` long-polling when SSE is blocked by a tunnel/proxy, and immediately starts polling updates on capture start to avoid first-attempt stalls over ngrok/mobile networks.
 
 ## How to Run
 
@@ -400,6 +400,6 @@ app.listen(port, () => {
     console.log(`🚀 Deep Downloader: http://localhost:${port}`);
 });
 
-Note: local replay URL/script rewriting is currently disabled (`ENABLE_LOCAL_REPLAY = false`) to keep compatibility while investigating regressions.
+Note: local replay URL/script rewriting is enabled by default (`ENABLE_LOCAL_REPLAY = true`).
 
 MHTML snapshot capture is best-effort; if `Page.captureSnapshot` fails on a site/browser build, capture continues and still saves HTML plus network assets.

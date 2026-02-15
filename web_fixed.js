@@ -14,7 +14,7 @@ const sseEvents = new EventEmitter();
 sseEvents.setMaxListeners(0);
 const eventHistory = [];
 let eventSeq = 0;
-const ENABLE_LOCAL_REPLAY = false;
+const ENABLE_LOCAL_REPLAY = true;
 
 function publishUpdate(data) {
     eventSeq += 1;
@@ -309,6 +309,25 @@ app.get('/', (req, res) => {
                     }
                 }
 
+                async function syncLatestEventCursor() {
+                    try {
+                        const response = await fetch('/events-poll?since=0', {
+                            headers: { 'Accept': 'application/json', 'ngrok-skip-browser-warning': 'true' }
+                        });
+                        if (!response.ok) return;
+                        const payload = await response.json();
+                        latestEventId = payload.latest || 0;
+                    } catch (error) {
+                        console.warn('Failed to sync latest event cursor:', error.message);
+                    }
+                }
+
+                function ensurePolling() {
+                    if (usePolling) return;
+                    usePolling = true;
+                    pollEvents();
+                }
+
                 async function pollEvents() {
                     if (!usePolling) return;
                     try {
@@ -341,10 +360,7 @@ app.get('/', (req, res) => {
                 eventSource.onerror = function(err) {
                     console.error('EventSource failed:', err);
                     document.getElementById('status').innerText = '⚠️ SSE blocked by tunnel/proxy, switching to polling updates...';
-                    if (!usePolling) {
-                        usePolling = true;
-                        pollEvents();
-                    }
+                    ensurePolling();
                 };
 
                 document.addEventListener('DOMContentLoaded', () => {
@@ -367,6 +383,7 @@ app.get('/', (req, res) => {
                     currentSitePath = null; // Reset on new load
 
                     try {
+                        await syncLatestEventCursor();
                         // Send a non-blocking request to start capture
                         const response = await fetch('/capture-start', {
                             method: 'POST',
@@ -380,7 +397,8 @@ app.get('/', (req, res) => {
 
                         if (response.ok) {
                             status.innerText = "📡 Server is capturing...";
-                            // Further updates will come via SSE
+                            // Further updates will come via SSE or polling fallback
+                            ensurePolling();
                         } else {
                             status.innerText = "❌ Server failed to start capture (HTTP " + response.status + ").";
                         }
