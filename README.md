@@ -403,3 +403,5 @@ app.listen(port, () => {
 Note: local replay URL/script rewriting is enabled by default (`ENABLE_LOCAL_REPLAY = true`).
 
 MHTML snapshot capture is best-effort; if `Page.captureSnapshot` fails on a site/browser build, capture continues and still saves HTML plus network assets.
+
+The viewer now tracks a page version and will not reload the iframe for duplicate `complete` updates unless the saved page content actually changed.

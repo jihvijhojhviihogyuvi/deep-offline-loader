@@ -285,6 +285,8 @@ app.get('/', (req, res) => {
             <script>
                 let usePolling = false;
                 let latestEventId = 0;
+                let currentRenderedSitePath = null;
+                let currentRenderedPageVersion = null;
 
                 function applyUpdate(data) {
                     const status = document.getElementById('status');
@@ -294,11 +296,21 @@ app.get('/', (req, res) => {
                     if (data.type === 'complete') {
                         iframe.style.display = 'block';
                         currentSitePath = data.sitePath || null; // Store for download
-                        if (data.sitePath) {
-                            iframe.src = '/view-site?sitePath=' + encodeURIComponent(data.sitePath);
-                        } else if (data.html) {
-                            iframe.srcdoc = data.html;
+
+                        const nextSitePath = data.sitePath || null;
+                        const nextPageVersion = data.pageVersion || null;
+                        const shouldReloadFrame = currentRenderedSitePath !== nextSitePath || currentRenderedPageVersion !== nextPageVersion;
+
+                        if (shouldReloadFrame) {
+                            if (data.sitePath) {
+                                iframe.src = '/view-site?sitePath=' + encodeURIComponent(data.sitePath);
+                            } else if (data.html) {
+                                iframe.srcdoc = data.html;
+                            }
+                            currentRenderedSitePath = nextSitePath;
+                            currentRenderedPageVersion = nextPageVersion;
                         }
+
                         status.innerText = data.fromCache ? "📁 [LOCAL] " + data.path : "🌐 [SAVED] " + data.path;
 
                         window.onmessage = (e) => {
@@ -570,7 +582,8 @@ async function captureSite(targetUrl) {
     let cachedHtml = null;
     if (hasCachedHtml) {
         cachedHtml = fs.readFileSync(siteFile, 'utf8');
-        publishUpdate( { type: 'complete', fromCache: true, path: urlObj.pathname, sitePath: siteDir, message: `Loaded cached HTML, refreshing dependencies: ${urlObj.pathname}` });
+        const cachedPageVersion = String(fs.statSync(siteFile).mtimeMs);
+        publishUpdate( { type: 'complete', fromCache: true, path: urlObj.pathname, sitePath: siteDir, pageVersion: cachedPageVersion, message: `Loaded cached HTML, refreshing dependencies: ${urlObj.pathname}` });
     }
 
     // Refresh dependency capture every run while preserving existing cached HTML unless missing.
@@ -702,7 +715,8 @@ async function captureSite(targetUrl) {
 
 
         if (!hasCachedHtml) {
-            publishUpdate( { type: 'complete', fromCache: false, path: urlObj.pathname, sitePath: siteDir, message: `Page captured with ${capturedRequests.length} assets: ${urlObj.pathname}` });
+            const savedPageVersion = String(fs.statSync(siteFile).mtimeMs);
+            publishUpdate( { type: 'complete', fromCache: false, path: urlObj.pathname, sitePath: siteDir, pageVersion: savedPageVersion, message: `Page captured with ${capturedRequests.length} assets: ${urlObj.pathname}` });
         } else {
             publishUpdate( { type: 'status', message: `Dependency refresh complete for cached page: ${urlObj.pathname}` });
         }
