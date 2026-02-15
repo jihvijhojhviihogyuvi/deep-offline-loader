@@ -11,7 +11,17 @@ const app = express();
 const port = 8000;
 
 const sseEvents = new EventEmitter();
-sseEvents.setMaxListeners(0); 
+sseEvents.setMaxListeners(0);
+const eventHistory = [];
+let eventSeq = 0;
+
+function publishUpdate(data) {
+    eventSeq += 1;
+    const entry = { id: eventSeq, data };
+    eventHistory.push(entry);
+    if (eventHistory.length > 500) eventHistory.shift();
+    sseEvents.emit('update', data);
+}
 
 app.use(express.json());
 
@@ -232,6 +242,13 @@ app.get('/events', (req, res) => {
     });
 });
 
+app.get('/events-poll', (req, res) => {
+    const sinceRaw = req.query.since;
+    const since = Number.isFinite(Number(sinceRaw)) ? Number(sinceRaw) : 0;
+    const events = eventHistory.filter((entry) => entry.id > since);
+    res.json({ latest: eventSeq, events });
+});
+
 
 app.get('/', (req, res) => {
     res.send(`
@@ -262,16 +279,10 @@ app.get('/', (req, res) => {
             </div>
 
             <script>
-                const eventSource = new EventSource('/events');
-                eventSource.onmessage = function(event) {
-                    let data;
-                    try {
-                        data = JSON.parse(event.data);
-                    } catch (parseError) {
-                        console.warn('Non-JSON SSE payload received:', event.data?.slice?.(0, 120));
-                        return;
-                    }
+                let usePolling = false;
+                let latestEventId = 0;
 
+                function applyUpdate(data) {
                     const status = document.getElementById('status');
                     const iframe = document.getElementById('displayFrame');
 
@@ -292,10 +303,44 @@ app.get('/', (req, res) => {
                     } else if (data.type === 'error') {
                         status.innerText = "❌ Error: " + data.message;
                     }
+                }
+
+                async function pollEvents() {
+                    if (!usePolling) return;
+                    try {
+                        const response = await fetch('/events-poll?since=' + latestEventId, {
+                            headers: { 'Accept': 'application/json', 'ngrok-skip-browser-warning': 'true' }
+                        });
+                        if (response.ok) {
+                            const payload = await response.json();
+                            latestEventId = payload.latest || latestEventId;
+                            (payload.events || []).forEach((entry) => applyUpdate(entry.data));
+                        }
+                    } catch (error) {
+                        console.warn('Polling events failed:', error.message);
+                    } finally {
+                        setTimeout(pollEvents, 1000);
+                    }
+                }
+
+                const eventSource = new EventSource('/events?ngrok-skip-browser-warning=true');
+                eventSource.onmessage = function(event) {
+                    let data;
+                    try {
+                        data = JSON.parse(event.data);
+                    } catch (parseError) {
+                        console.warn('Non-JSON SSE payload received:', event.data?.slice?.(0, 120));
+                        return;
+                    }
+                    applyUpdate(data);
                 };
                 eventSource.onerror = function(err) {
                     console.error('EventSource failed:', err);
-                    document.getElementById('status').innerText = '❌ Lost connection to updates (tunnel/proxy may block SSE).';
+                    document.getElementById('status').innerText = '⚠️ SSE blocked by tunnel/proxy, switching to polling updates...';
+                    if (!usePolling) {
+                        usePolling = true;
+                        pollEvents();
+                    }
                 };
 
                 document.addEventListener('DOMContentLoaded', () => {
@@ -487,7 +532,7 @@ app.post('/capture-start', (req, res) => {
 
 async function captureSite(targetUrl) {
     console.log(`[CAPTURE] captureSite function started for URL: ${targetUrl}`);
-    sseEvents.emit('update', { type: 'status', message: `Starting capture for ${targetUrl}...` });
+    publishUpdate( { type: 'status', message: `Starting capture for ${targetUrl}...` });
 
     if (!targetUrl.startsWith('http')) targetUrl = 'https://' + targetUrl;
     
@@ -503,17 +548,17 @@ async function captureSite(targetUrl) {
     let cachedHtml = null;
     if (hasCachedHtml) {
         cachedHtml = fs.readFileSync(siteFile, 'utf8');
-        sseEvents.emit('update', { type: 'complete', fromCache: true, path: urlObj.pathname, sitePath: siteDir, message: `Loaded cached HTML, refreshing dependencies: ${urlObj.pathname}` });
+        publishUpdate( { type: 'complete', fromCache: true, path: urlObj.pathname, sitePath: siteDir, message: `Loaded cached HTML, refreshing dependencies: ${urlObj.pathname}` });
     }
 
     // Refresh dependency capture every run while preserving existing cached HTML unless missing.
-    sseEvents.emit('update', { type: 'status', message: `Refreshing assets for ${targetUrl}...` });
+    publishUpdate( { type: 'status', message: `Refreshing assets for ${targetUrl}...` });
     console.log(`[FETCH] Refreshing dependency capture for: ${targetUrl}`);
-    sseEvents.emit('update', { type: 'status', message: `Fetching new page: ${targetUrl}` });
+    publishUpdate( { type: 'status', message: `Fetching new page: ${targetUrl}` });
     let browser;
     let userDataDir = null;
     try {
-        sseEvents.emit('update', { type: 'status', message: 'Launching browser...' });
+        publishUpdate( { type: 'status', message: 'Launching browser...' });
         console.log('[LOG] Launching browser...');
         const executablePath = resolveBrowserExecutable();
         userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dol-puppeteer-profile-'));
@@ -530,40 +575,40 @@ async function captureSite(targetUrl) {
         if (executablePath) {
             launchOptions.executablePath = executablePath;
             console.log(`[LOG] Using browser executable at ${executablePath}`);
-            sseEvents.emit('update', { type: 'status', message: `Using browser executable at ${executablePath}` });
+            publishUpdate( { type: 'status', message: `Using browser executable at ${executablePath}` });
         } else {
             console.log('[LOG] No system Chromium found, using Puppeteer default executable resolution.');
-            sseEvents.emit('update', { type: 'status', message: 'No system Chromium found, using Puppeteer default executable.' });
+            publishUpdate( { type: 'status', message: 'No system Chromium found, using Puppeteer default executable.' });
         }
 
         browser = await puppeteer.launch(launchOptions);
         console.log('[LOG] Browser launched.');
-        sseEvents.emit('update', { type: 'status', message: 'Browser launched.' });
+        publishUpdate( { type: 'status', message: 'Browser launched.' });
 
-        sseEvents.emit('update', { type: 'status', message: 'Creating new page...' });
+        publishUpdate( { type: 'status', message: 'Creating new page...' });
         const page = await browser.newPage();
         console.log('[LOG] New page created.');
-        sseEvents.emit('update', { type: 'status', message: 'New page created.' });
+        publishUpdate( { type: 'status', message: 'New page created.' });
 
         await page.setCacheEnabled(false);
         const networkDir = path.join(siteDir, 'network_assets');
         const networkCapture = setupNetworkCapture(page, networkDir);
-        sseEvents.emit('update', { type: 'status', message: 'Network capture enabled (saving all requested assets).' });
+        publishUpdate( { type: 'status', message: 'Network capture enabled (saving all requested assets).' });
 
-        sseEvents.emit('update', { type: 'status', message: 'Bypassing CSP...' });
+        publishUpdate( { type: 'status', message: 'Bypassing CSP...' });
         await page.setBypassCSP(true);
         console.log('[LOG] Bypassing CSP.');
-        sseEvents.emit('update', { type: 'status', message: 'CSP bypassed.' });
+        publishUpdate( { type: 'status', message: 'CSP bypassed.' });
 
 
-        sseEvents.emit('update', { type: 'status', message: `Navigating to ${targetUrl}...` });
+        publishUpdate( { type: 'status', message: `Navigating to ${targetUrl}...` });
         console.log(`[LOG] Navigating to ${targetUrl}...`);
         await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 60000 });
         console.log('[LOG] Navigation complete.');
-        sseEvents.emit('update', { type: 'status', message: 'Navigation complete.' });
+        publishUpdate( { type: 'status', message: 'Navigation complete.' });
 
 
-        sseEvents.emit('update', { type: 'status', message: 'Evaluating page content...' });
+        publishUpdate( { type: 'status', message: 'Evaluating page content...' });
         const gameData = await page.evaluate(() => {
             // Hijack links to keep them in our system
             document.querySelectorAll('a').forEach(link => {
@@ -575,30 +620,30 @@ async function captureSite(targetUrl) {
             return document.documentElement.outerHTML;
         });
         console.log('[LOG] Page evaluated.');
-        sseEvents.emit('update', { type: 'status', message: 'Page content evaluated.' });
+        publishUpdate( { type: 'status', message: 'Page content evaluated.' });
 
-        sseEvents.emit('update', { type: 'status', message: 'Capturing full page snapshot (including iframe content)...' });
+        publishUpdate( { type: 'status', message: 'Capturing full page snapshot (including iframe content)...' });
         const cdpSession = await page.target().createCDPSession();
         await cdpSession.send('Page.enable');
         const snapshot = await cdpSession.send('Page.captureSnapshot', { format: 'mhtml' });
         console.log('[LOG] Full MHTML snapshot captured.');
-        sseEvents.emit('update', { type: 'status', message: 'Full page snapshot captured.' });
+        publishUpdate( { type: 'status', message: 'Full page snapshot captured.' });
 
-        sseEvents.emit('update', { type: 'status', message: 'Finalizing network asset capture...' });
+        publishUpdate( { type: 'status', message: 'Finalizing network asset capture...' });
         const capturedRequests = await networkCapture.finalize();
         const networkManifestFile = path.join(siteDir, 'network_manifest.json');
 
 
         // Ensure directories exist and save
-        sseEvents.emit('update', { type: 'status', message: `Ensuring directory exists: ${siteDir}` });
+        publishUpdate( { type: 'status', message: `Ensuring directory exists: ${siteDir}` });
         if (!fs.existsSync(siteDir)) fs.mkdirSync(siteDir, { recursive: true });
 
         const htmlToStore = hasCachedHtml && cachedHtml ? cachedHtml : gameData;
         if (!hasCachedHtml) {
-            sseEvents.emit('update', { type: 'status', message: `Saving site to ${siteFile}` });
+            publishUpdate( { type: 'status', message: `Saving site to ${siteFile}` });
             fs.writeFileSync(siteFile, htmlToStore);
         } else {
-            sseEvents.emit('update', { type: 'status', message: 'Keeping cached HTML and updating dependency files only.' });
+            publishUpdate( { type: 'status', message: 'Keeping cached HTML and updating dependency files only.' });
         }
 
         fs.writeFileSync(snapshotFile, snapshot.data);
@@ -617,27 +662,27 @@ async function captureSite(targetUrl) {
         fs.writeFileSync(networkManifestFile, JSON.stringify(mergedManifest, null, 2));
 
         console.log(`[LOG] Dependency refresh complete for ${siteFile}`);
-        sseEvents.emit('update', { type: 'status', message: `Dependencies refreshed (${capturedRequests.length} new requests, ${mergedManifest.length} total tracked).` });
+        publishUpdate( { type: 'status', message: `Dependencies refreshed (${capturedRequests.length} new requests, ${mergedManifest.length} total tracked).` });
 
-        sseEvents.emit('update', { type: 'status', message: 'Closing browser...' });
+        publishUpdate( { type: 'status', message: 'Closing browser...' });
         await browser.close();
         browser = null;
         fs.rmSync(userDataDir, { recursive: true, force: true });
         console.log('[LOG] Browser closed.');
-        sseEvents.emit('update', { type: 'status', message: 'Browser closed.' });
+        publishUpdate( { type: 'status', message: 'Browser closed.' });
 
 
         if (!hasCachedHtml) {
-            sseEvents.emit('update', { type: 'complete', fromCache: false, path: urlObj.pathname, sitePath: siteDir, message: `Page captured with ${capturedRequests.length} assets: ${urlObj.pathname}` });
+            publishUpdate( { type: 'complete', fromCache: false, path: urlObj.pathname, sitePath: siteDir, message: `Page captured with ${capturedRequests.length} assets: ${urlObj.pathname}` });
         } else {
-            sseEvents.emit('update', { type: 'status', message: `Dependency refresh complete for cached page: ${urlObj.pathname}` });
+            publishUpdate( { type: 'status', message: `Dependency refresh complete for cached page: ${urlObj.pathname}` });
         }
 
     } catch (error) {
         console.error('[ERROR] An error occurred during capture:', error);
-        sseEvents.emit('update', { type: 'error', message: `Capture failed: ${error.message}` });
+        publishUpdate( { type: 'error', message: `Capture failed: ${error.message}` });
         if (browser) {
-            sseEvents.emit('update', { type: 'status', message: 'Closing browser due to error...' });
+            publishUpdate( { type: 'status', message: 'Closing browser due to error...' });
             await browser.close();
         }
         if (typeof userDataDir === 'string') {
