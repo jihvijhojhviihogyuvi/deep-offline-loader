@@ -276,10 +276,14 @@ app.get('/', (req, res) => {
                     const iframe = document.getElementById('displayFrame');
 
                     status.innerText = '📡 ' + data.message;
-                    if (data.type === 'complete' && data.html) {
+                    if (data.type === 'complete') {
                         iframe.style.display = 'block';
-                        iframe.srcdoc = data.html;
-                        currentSitePath = data.sitePath; // Store for download
+                        currentSitePath = data.sitePath || null; // Store for download
+                        if (data.sitePath) {
+                            iframe.src = '/view-site?sitePath=' + encodeURIComponent(data.sitePath);
+                        } else if (data.html) {
+                            iframe.srcdoc = data.html;
+                        }
                         status.innerText = data.fromCache ? "📁 [LOCAL] " + data.path : "🌐 [SAVED] " + data.path;
 
                         window.onmessage = (e) => {
@@ -325,25 +329,11 @@ app.get('/', (req, res) => {
                             body: JSON.stringify({ url })
                         });
 
-                        const responseText = await response.text();
-                        let result = null;
-                        try {
-                            result = JSON.parse(responseText);
-                        } catch (parseError) {
-                            const isHtml = /^\s*<(?:!doctype|html)\b/i.test(responseText);
-                            if (isHtml) {
-                                status.innerText = "❌ Capture start was blocked by a proxy/tunnel HTML response. If using ngrok, open the tunnel URL once in browser or use ngrok-skip-browser-warning.";
-                            } else {
-                                status.innerText = "❌ Invalid server response while starting capture.";
-                            }
-                            return;
-                        }
-
-                        if (result.status === 'started') {
+                        if (response.ok) {
                             status.innerText = "📡 Server is capturing...";
                             // Further updates will come via SSE
                         } else {
-                            status.innerText = "❌ Server failed to start capture: " + (result.message || 'Unknown error');
+                            status.innerText = "❌ Server failed to start capture (HTTP " + response.status + ").";
                         }
                     } catch (err) {
                         status.innerText = "❌ Client error: " + err.message;
@@ -361,6 +351,23 @@ app.get('/', (req, res) => {
         </body>
         </html>
     `);
+});
+
+app.get('/view-site', (req, res) => {
+    const sitePath = req.query.sitePath;
+    if (!isSafeSitePath(sitePath)) {
+        return res.status(400).send('Invalid site path.');
+    }
+
+    const siteFile = path.join(sitePath, 'index.html');
+    if (!fs.existsSync(siteFile)) {
+        return res.status(404).send('Saved page not found.');
+    }
+
+    const savedHtml = fs.readFileSync(siteFile, 'utf8');
+    const preparedHtml = prepareHtmlForOfflineReplay(savedHtml, sitePath);
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.send(preparedHtml);
 });
 
 // New route to download the currently viewed site as a zip file
@@ -496,8 +503,7 @@ async function captureSite(targetUrl) {
     let cachedHtml = null;
     if (hasCachedHtml) {
         cachedHtml = fs.readFileSync(siteFile, 'utf8');
-        const rewrittenCachedHtml = prepareHtmlForOfflineReplay(cachedHtml, siteDir);
-        sseEvents.emit('update', { type: 'complete', html: rewrittenCachedHtml, fromCache: true, path: urlObj.pathname, sitePath: siteDir, message: `Loaded cached HTML, refreshing dependencies: ${urlObj.pathname}` });
+        sseEvents.emit('update', { type: 'complete', fromCache: true, path: urlObj.pathname, sitePath: siteDir, message: `Loaded cached HTML, refreshing dependencies: ${urlObj.pathname}` });
     }
 
     // Refresh dependency capture every run while preserving existing cached HTML unless missing.
@@ -622,8 +628,7 @@ async function captureSite(targetUrl) {
 
 
         if (!hasCachedHtml) {
-            const rewrittenGameData = prepareHtmlForOfflineReplay(gameData, siteDir);
-            sseEvents.emit('update', { type: 'complete', html: rewrittenGameData, fromCache: false, path: urlObj.pathname, sitePath: siteDir, message: `Page captured with ${capturedRequests.length} assets: ${urlObj.pathname}` });
+            sseEvents.emit('update', { type: 'complete', fromCache: false, path: urlObj.pathname, sitePath: siteDir, message: `Page captured with ${capturedRequests.length} assets: ${urlObj.pathname}` });
         } else {
             sseEvents.emit('update', { type: 'status', message: `Dependency refresh complete for cached page: ${urlObj.pathname}` });
         }
