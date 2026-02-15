@@ -14,6 +14,7 @@ const sseEvents = new EventEmitter();
 sseEvents.setMaxListeners(0);
 const eventHistory = [];
 let eventSeq = 0;
+const ENABLE_LOCAL_REPLAY = false;
 
 function publishUpdate(data) {
     eventSeq += 1;
@@ -109,6 +110,7 @@ function findAssetEntry(manifest, requestedUrl, method = 'GET') {
 }
 
 function injectOfflineReplayScript(html, siteDir) {
+    if (!ENABLE_LOCAL_REPLAY) return html;
     const replayScript = `
 <script>
 (() => {
@@ -157,6 +159,7 @@ function injectOfflineReplayScript(html, siteDir) {
 }
 
 function prepareHtmlForOfflineReplay(html, siteDir) {
+    if (!ENABLE_LOCAL_REPLAY) return html;
     const rewritten = rewriteHtmlToLocalAssets(html, siteDir);
     return injectOfflineReplayScript(rewritten, siteDir);
 }
@@ -181,6 +184,7 @@ function escapeRegExp(text) {
 }
 
 function rewriteHtmlToLocalAssets(html, siteDir) {
+    if (!ENABLE_LOCAL_REPLAY) return html;
     const manifest = loadNetworkManifest(siteDir);
     if (!manifest.length) return html;
 
