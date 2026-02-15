@@ -5,6 +5,7 @@ const path = require('path');
 const archiver = require('archiver');
 const EventEmitter = require('events');
 const crypto = require('crypto');
+const os = require('os');
 
 const app = express();
 const port = 8000;
@@ -478,12 +479,15 @@ async function captureSite(targetUrl) {
     console.log(`[FETCH] Refreshing dependency capture for: ${targetUrl}`);
     sseEvents.emit('update', { type: 'status', message: `Fetching new page: ${targetUrl}` });
     let browser;
+    let userDataDir = null;
     try {
         sseEvents.emit('update', { type: 'status', message: 'Launching browser...' });
         console.log('[LOG] Launching browser...');
         const executablePath = resolveBrowserExecutable();
+        userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dol-puppeteer-profile-'));
         const launchOptions = {
             headless: true,
+            userDataDir,
             args: [
                 '--disable-web-security',
                 '--no-sandbox', // Required for Docker/some Linux environments
@@ -585,6 +589,8 @@ async function captureSite(targetUrl) {
 
         sseEvents.emit('update', { type: 'status', message: 'Closing browser...' });
         await browser.close();
+        browser = null;
+        fs.rmSync(userDataDir, { recursive: true, force: true });
         console.log('[LOG] Browser closed.');
         sseEvents.emit('update', { type: 'status', message: 'Browser closed.' });
 
@@ -602,6 +608,9 @@ async function captureSite(targetUrl) {
         if (browser) {
             sseEvents.emit('update', { type: 'status', message: 'Closing browser due to error...' });
             await browser.close();
+        }
+        if (typeof userDataDir === 'string') {
+            fs.rmSync(userDataDir, { recursive: true, force: true });
         }
     }
 }

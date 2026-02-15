@@ -6,6 +6,8 @@ It saves the page HTML as captured (without rewriting iframe `src` to `srcdoc`) 
 
 Each capture now refreshes dependency downloads (cache disabled during capture) and records every HTTP(S) response requested during that run into `network_assets/` plus a `network_manifest.json`. When loading from saved HTML, known captured remote URLs are rewritten to local `/asset` URLs, and an offline replay shim rewrites runtime `fetch`/XHR/beacon requests to local assets too, while cached `index.html` remains unchanged on disk.
 
+Capture launches now use an isolated temporary Chromium profile per run to avoid `userDataDir` lock conflicts when multiple captures are started close together.
+
 ## How to Run
 
 1.  **Install Dependencies:**
