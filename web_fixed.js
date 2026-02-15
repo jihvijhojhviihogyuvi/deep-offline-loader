@@ -627,11 +627,18 @@ async function captureSite(targetUrl) {
         publishUpdate( { type: 'status', message: 'Page content evaluated.' });
 
         publishUpdate( { type: 'status', message: 'Capturing full page snapshot (including iframe content)...' });
-        const cdpSession = await page.target().createCDPSession();
-        await cdpSession.send('Page.enable');
-        const snapshot = await cdpSession.send('Page.captureSnapshot', { format: 'mhtml' });
-        console.log('[LOG] Full MHTML snapshot captured.');
-        publishUpdate( { type: 'status', message: 'Full page snapshot captured.' });
+        let snapshotData = null;
+        try {
+            const cdpSession = await page.target().createCDPSession();
+            await cdpSession.send('Page.enable');
+            const snapshot = await cdpSession.send('Page.captureSnapshot', { format: 'mhtml' });
+            snapshotData = snapshot.data;
+            console.log('[LOG] Full MHTML snapshot captured.');
+            publishUpdate( { type: 'status', message: 'Full page snapshot captured.' });
+        } catch (snapshotError) {
+            console.warn('[WARN] MHTML snapshot failed, continuing without snapshot.mhtml:', snapshotError.message);
+            publishUpdate( { type: 'status', message: `MHTML snapshot unavailable (${snapshotError.message}). Continuing...` });
+        }
 
         publishUpdate( { type: 'status', message: 'Finalizing network asset capture...' });
         const capturedRequests = await networkCapture.finalize();
@@ -650,7 +657,7 @@ async function captureSite(targetUrl) {
             publishUpdate( { type: 'status', message: 'Keeping cached HTML and updating dependency files only.' });
         }
 
-        fs.writeFileSync(snapshotFile, snapshot.data);
+        if (snapshotData) fs.writeFileSync(snapshotFile, snapshotData);
 
         let existingManifest = [];
         if (fs.existsSync(networkManifestFile)) {

@@ -401,3 +401,5 @@ app.listen(port, () => {
 });
 
 Note: local replay URL/script rewriting is currently disabled (`ENABLE_LOCAL_REPLAY = false`) to keep compatibility while investigating regressions.
+
+MHTML snapshot capture is best-effort; if `Page.captureSnapshot` fails on a site/browser build, capture continues and still saves HTML plus network assets.
