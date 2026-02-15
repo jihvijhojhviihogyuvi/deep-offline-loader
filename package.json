@@ -1,0 +1,8 @@
+{
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "depd": "^2.0.0",
+    "express": "^5.2.1",
+    "puppeteer": "^24.37.2"
+  }
+}
