@@ -206,6 +206,7 @@ app.get('/events', (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
     req.socket.setNoDelay(true); // Disable Nagle's algorithm for immediate sending
     res.flushHeaders();
 
@@ -263,7 +264,14 @@ app.get('/', (req, res) => {
             <script>
                 const eventSource = new EventSource('/events');
                 eventSource.onmessage = function(event) {
-                    const data = JSON.parse(event.data);
+                    let data;
+                    try {
+                        data = JSON.parse(event.data);
+                    } catch (parseError) {
+                        console.warn('Non-JSON SSE payload received:', event.data?.slice?.(0, 120));
+                        return;
+                    }
+
                     const status = document.getElementById('status');
                     const iframe = document.getElementById('displayFrame');
 
@@ -283,7 +291,7 @@ app.get('/', (req, res) => {
                 };
                 eventSource.onerror = function(err) {
                     console.error('EventSource failed:', err);
-                    document.getElementById('status').innerText = '❌ Lost connection to updates.';
+                    document.getElementById('status').innerText = '❌ Lost connection to updates (tunnel/proxy may block SSE).';
                 };
 
                 document.addEventListener('DOMContentLoaded', () => {
@@ -322,7 +330,7 @@ app.get('/', (req, res) => {
                         try {
                             result = JSON.parse(responseText);
                         } catch (parseError) {
-                            const isHtml = responseText.trim().startsWith('<!doctype') || responseText.trim().startsWith('<html');
+                            const isHtml = /^\s*<(?:!doctype|html)\b/i.test(responseText);
                             if (isHtml) {
                                 status.innerText = "❌ Capture start was blocked by a proxy/tunnel HTML response. If using ngrok, open the tunnel URL once in browser or use ngrok-skip-browser-warning.";
                             } else {
