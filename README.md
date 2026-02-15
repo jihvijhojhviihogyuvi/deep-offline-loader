@@ -4,7 +4,7 @@ This project is a web application that allows you to download and archive websit
 
 It saves the page HTML as captured (without rewriting iframe `src` to `srcdoc`) and also saves a full-page `snapshot.mhtml` using Chrome's `Page.captureSnapshot` as a fallback artifact.
 
-Each capture now refreshes dependency downloads (cache disabled during capture) and records every HTTP(S) response requested during that run into `network_assets/` plus a `network_manifest.json`. If cached `index.html` already exists, it is kept as-is while dependency files/manifests are updated.
+Each capture now refreshes dependency downloads (cache disabled during capture) and records every HTTP(S) response requested during that run into `network_assets/` plus a `network_manifest.json`. When loading from saved HTML, known captured remote URLs are rewritten to local `/asset` URLs so iframe/script/style/image requests can resolve offline while cached `index.html` remains unchanged on disk.
 
 ## How to Run
 

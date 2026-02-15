@@ -88,6 +88,40 @@ function mergeNetworkManifests(existingEntries, newEntries) {
     return Array.from(mergedByKey.values());
 }
 
+
+function isSafeSitePath(sitePath) {
+    return Boolean(sitePath) && sitePath.startsWith(STORAGE_DIR) && !sitePath.includes('..');
+}
+
+function loadNetworkManifest(siteDir) {
+    const networkManifestFile = path.join(siteDir, 'network_manifest.json');
+    if (!fs.existsSync(networkManifestFile)) return [];
+    try {
+        const parsed = JSON.parse(fs.readFileSync(networkManifestFile, 'utf8'));
+        return Array.isArray(parsed) ? parsed : [];
+    } catch (error) {
+        return [];
+    }
+}
+
+function escapeRegExp(text) {
+    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function rewriteHtmlToLocalAssets(html, siteDir) {
+    const manifest = loadNetworkManifest(siteDir);
+    if (!manifest.length) return html;
+
+    let rewritten = html;
+    manifest.forEach((entry) => {
+        if (!entry || !entry.url || !entry.bodyPath) return;
+        const localUrl = `/asset?sitePath=${encodeURIComponent(siteDir)}&url=${encodeURIComponent(entry.url)}`;
+        rewritten = rewritten.replace(new RegExp(escapeRegExp(entry.url), 'g'), localUrl);
+    });
+
+    return rewritten;
+}
+
 function resolveBrowserExecutable() {
     const candidates = [
         process.env.PUPPETEER_EXECUTABLE_PATH,
@@ -247,7 +281,7 @@ app.get('/download-current-site', async (req, res) => {
     console.log(`[DOWNLOAD] Request to download site from: ${sitePath}`);
 
     // Security: Ensure the path is within the STORAGE_DIR
-    if (!sitePath || !sitePath.startsWith(STORAGE_DIR) || sitePath.includes('..')) {
+    if (!isSafeSitePath(sitePath)) {
         console.error(`[DOWNLOAD] Invalid site path attempted: ${sitePath}`);
         return res.status(400).send('Invalid site path.');
     }
@@ -283,6 +317,31 @@ app.get('/download-current-site', async (req, res) => {
             res.status(500).send({ error: err.message });
         }
     });
+});
+
+app.get('/asset', (req, res) => {
+    const sitePath = req.query.sitePath;
+    const requestedUrl = req.query.url;
+
+    if (!isSafeSitePath(sitePath) || !requestedUrl) {
+        return res.status(400).send('Invalid asset request.');
+    }
+
+    const manifest = loadNetworkManifest(sitePath);
+    const assetEntry = manifest.find((entry) => entry.url === requestedUrl && entry.bodyPath && fs.existsSync(entry.bodyPath));
+
+    if (!assetEntry) {
+        return res.status(404).send('Asset not found.');
+    }
+
+    const resolvedAssetPath = path.resolve(assetEntry.bodyPath);
+    if (!resolvedAssetPath.startsWith(sitePath)) {
+        return res.status(400).send('Invalid asset path.');
+    }
+
+    const contentType = assetEntry.headers && (assetEntry.headers['content-type'] || assetEntry.headers['Content-Type']);
+    if (contentType) res.setHeader('Content-Type', contentType);
+    return res.sendFile(resolvedAssetPath);
 });
 
 // DEPRECATED: This route downloads all saved sites.
@@ -349,7 +408,8 @@ async function captureSite(targetUrl) {
     let cachedHtml = null;
     if (hasCachedHtml) {
         cachedHtml = fs.readFileSync(siteFile, 'utf8');
-        sseEvents.emit('update', { type: 'complete', html: cachedHtml, fromCache: true, path: urlObj.pathname, sitePath: siteDir, message: `Loaded cached HTML, refreshing dependencies: ${urlObj.pathname}` });
+        const rewrittenCachedHtml = rewriteHtmlToLocalAssets(cachedHtml, siteDir);
+        sseEvents.emit('update', { type: 'complete', html: rewrittenCachedHtml, fromCache: true, path: urlObj.pathname, sitePath: siteDir, message: `Loaded cached HTML, refreshing dependencies: ${urlObj.pathname}` });
     }
 
     // Refresh dependency capture every run while preserving existing cached HTML unless missing.
@@ -469,7 +529,8 @@ async function captureSite(targetUrl) {
 
 
         if (!hasCachedHtml) {
-            sseEvents.emit('update', { type: 'complete', html: gameData, fromCache: false, path: urlObj.pathname, sitePath: siteDir, message: `Page captured with ${capturedRequests.length} assets: ${urlObj.pathname}` });
+            const rewrittenGameData = rewriteHtmlToLocalAssets(gameData, siteDir);
+            sseEvents.emit('update', { type: 'complete', html: rewrittenGameData, fromCache: false, path: urlObj.pathname, sitePath: siteDir, message: `Page captured with ${capturedRequests.length} assets: ${urlObj.pathname}` });
         } else {
             sseEvents.emit('update', { type: 'status', message: `Dependency refresh complete for cached page: ${urlObj.pathname}` });
         }
