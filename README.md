@@ -2,7 +2,7 @@
 
 This project is a web application that allows you to download and archive websites for offline viewing. It uses Node.js, Express, and Puppeteer to capture the full HTML of a given URL and all its assets.
 
-It now also inlines iframe/subframe HTML directly into saved `index.html` via `srcdoc` for better offline playback, and saves a full-page `snapshot.mhtml` using Chrome's `Page.captureSnapshot` as a complete fallback artifact.
+It saves the page HTML as captured (without rewriting iframe `src` to `srcdoc`) and also saves a full-page `snapshot.mhtml` using Chrome's `Page.captureSnapshot` as a fallback artifact.
 
 Each capture now refreshes dependency downloads (cache disabled during capture) and records every HTTP(S) response requested during that run into `network_assets/` plus a `network_manifest.json`. If cached `index.html` already exists, it is kept as-is while dependency files/manifests are updated.
 

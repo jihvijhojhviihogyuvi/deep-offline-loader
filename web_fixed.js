@@ -406,71 +406,8 @@ async function captureSite(targetUrl) {
         sseEvents.emit('update', { type: 'status', message: 'Navigation complete.' });
 
 
-        sseEvents.emit('update', { type: 'status', message: 'Inlining iframe content for offline use...' });
-        const mainFrame = page.mainFrame();
-        const frameDepth = (frame) => {
-            let depth = 0;
-            let current = frame;
-            while (current.parentFrame()) {
-                depth += 1;
-                current = current.parentFrame();
-            }
-            return depth;
-        };
-
-        const frameHtmlByUrl = new Map();
-        const nonMainFrames = page.frames().filter(frame => frame !== mainFrame);
-        nonMainFrames.sort((a, b) => frameDepth(b) - frameDepth(a));
-
-        for (const frame of nonMainFrames) {
-            const childSnapshots = frame.childFrames()
-                .map(child => ({ url: child.url(), html: frameHtmlByUrl.get(child.url()) }))
-                .filter(snapshot => snapshot.url && snapshot.html);
-
-            await frame.evaluate((snapshots) => {
-                const snapshotsByUrl = new Map();
-                snapshots.forEach(snapshot => {
-                    if (!snapshotsByUrl.has(snapshot.url)) snapshotsByUrl.set(snapshot.url, []);
-                    snapshotsByUrl.get(snapshot.url).push(snapshot.html);
-                });
-
-                document.querySelectorAll('iframe').forEach((iframe) => {
-                    const sourceUrl = iframe.src;
-                    const queue = snapshotsByUrl.get(sourceUrl);
-                    if (!queue || queue.length === 0) return;
-                    const html = queue.shift();
-                    iframe.setAttribute('data-offline-src', sourceUrl);
-                    iframe.setAttribute('srcdoc', html);
-                    iframe.removeAttribute('src');
-                });
-            }, childSnapshots);
-
-            const frameHtml = await frame.content();
-            if (frame.url() && frameHtml) frameHtmlByUrl.set(frame.url(), frameHtml);
-        }
-
         sseEvents.emit('update', { type: 'status', message: 'Evaluating page content...' });
-        const topLevelChildSnapshots = mainFrame.childFrames()
-            .map(child => ({ url: child.url(), html: frameHtmlByUrl.get(child.url()) }))
-            .filter(snapshot => snapshot.url && snapshot.html);
-
-        const gameData = await page.evaluate((snapshots) => {
-            const snapshotsByUrl = new Map();
-            snapshots.forEach(snapshot => {
-                if (!snapshotsByUrl.has(snapshot.url)) snapshotsByUrl.set(snapshot.url, []);
-                snapshotsByUrl.get(snapshot.url).push(snapshot.html);
-            });
-
-            document.querySelectorAll('iframe').forEach((iframe) => {
-                const sourceUrl = iframe.src;
-                const queue = snapshotsByUrl.get(sourceUrl);
-                if (!queue || queue.length === 0) return;
-                const html = queue.shift();
-                iframe.setAttribute('data-offline-src', sourceUrl);
-                iframe.setAttribute('srcdoc', html);
-                iframe.removeAttribute('src');
-            });
-
+        const gameData = await page.evaluate(() => {
             // Hijack links to keep them in our system
             document.querySelectorAll('a').forEach(link => {
                 link.onclick = (e) => {
@@ -479,9 +416,9 @@ async function captureSite(targetUrl) {
                 };
             });
             return document.documentElement.outerHTML;
-        }, topLevelChildSnapshots);
+        });
         console.log('[LOG] Page evaluated.');
-        sseEvents.emit('update', { type: 'status', message: 'Page content evaluated with iframe content inlined.' });
+        sseEvents.emit('update', { type: 'status', message: 'Page content evaluated.' });
 
         sseEvents.emit('update', { type: 'status', message: 'Capturing full page snapshot (including iframe content)...' });
         const cdpSession = await page.target().createCDPSession();
