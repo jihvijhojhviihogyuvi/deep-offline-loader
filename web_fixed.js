@@ -89,6 +89,67 @@ function mergeNetworkManifests(existingEntries, newEntries) {
 }
 
 
+
+function findAssetEntry(manifest, requestedUrl, method = 'GET') {
+    const normalizedMethod = (method || 'GET').toUpperCase();
+    const exactMethod = manifest.find((entry) => entry.url === requestedUrl && (entry.method || 'GET').toUpperCase() === normalizedMethod && entry.bodyPath && fs.existsSync(entry.bodyPath));
+    if (exactMethod) return exactMethod;
+    return manifest.find((entry) => entry.url === requestedUrl && entry.bodyPath && fs.existsSync(entry.bodyPath));
+}
+
+function injectOfflineReplayScript(html, siteDir) {
+    const replayScript = `
+<script>
+(() => {
+  const sitePath = ${JSON.stringify(siteDir)};
+  const toReplayUrl = (rawUrl, method = 'GET') => {
+    try {
+      const absolute = new URL(rawUrl, window.location.href);
+      if (!/^https?:$/i.test(absolute.protocol)) return rawUrl;
+      return '/asset?sitePath=' + encodeURIComponent(sitePath) + '&url=' + encodeURIComponent(absolute.href) + '&method=' + encodeURIComponent((method || 'GET').toUpperCase());
+    } catch (_) {
+      return rawUrl;
+    }
+  };
+
+  const originalFetch = window.fetch ? window.fetch.bind(window) : null;
+  if (originalFetch) {
+    window.fetch = (input, init = {}) => {
+      const method = (init && init.method) || (input && input.method) || 'GET';
+      if (typeof input === 'string') {
+        return originalFetch(toReplayUrl(input, method), init);
+      }
+      if (input && typeof input.url === 'string') {
+        return originalFetch(toReplayUrl(input.url, method), init);
+      }
+      return originalFetch(input, init);
+    };
+  }
+
+  const originalOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+    const rewritten = typeof url === 'string' ? toReplayUrl(url, method) : url;
+    return originalOpen.call(this, method, rewritten, ...rest);
+  };
+
+  if (navigator && typeof navigator.sendBeacon === 'function') {
+    const originalSendBeacon = navigator.sendBeacon.bind(navigator);
+    navigator.sendBeacon = (url, data) => originalSendBeacon(toReplayUrl(url, 'POST'), data);
+  }
+})();
+</script>
+`;
+
+    if (html.includes('</head>')) return html.replace('</head>', `${replayScript}</head>`);
+    if (html.includes('<body')) return html.replace(/<body[^>]*>/i, (tag) => `${tag}${replayScript}`);
+    return `${replayScript}${html}`;
+}
+
+function prepareHtmlForOfflineReplay(html, siteDir) {
+    const rewritten = rewriteHtmlToLocalAssets(html, siteDir);
+    return injectOfflineReplayScript(rewritten, siteDir);
+}
+
 function isSafeSitePath(sitePath) {
     return Boolean(sitePath) && sitePath.startsWith(STORAGE_DIR) && !sitePath.includes('..');
 }
@@ -328,7 +389,7 @@ app.get('/asset', (req, res) => {
     }
 
     const manifest = loadNetworkManifest(sitePath);
-    const assetEntry = manifest.find((entry) => entry.url === requestedUrl && entry.bodyPath && fs.existsSync(entry.bodyPath));
+    const assetEntry = findAssetEntry(manifest, requestedUrl, req.query.method || 'GET');
 
     if (!assetEntry) {
         return res.status(404).send('Asset not found.');
@@ -408,7 +469,7 @@ async function captureSite(targetUrl) {
     let cachedHtml = null;
     if (hasCachedHtml) {
         cachedHtml = fs.readFileSync(siteFile, 'utf8');
-        const rewrittenCachedHtml = rewriteHtmlToLocalAssets(cachedHtml, siteDir);
+        const rewrittenCachedHtml = prepareHtmlForOfflineReplay(cachedHtml, siteDir);
         sseEvents.emit('update', { type: 'complete', html: rewrittenCachedHtml, fromCache: true, path: urlObj.pathname, sitePath: siteDir, message: `Loaded cached HTML, refreshing dependencies: ${urlObj.pathname}` });
     }
 
@@ -529,7 +590,7 @@ async function captureSite(targetUrl) {
 
 
         if (!hasCachedHtml) {
-            const rewrittenGameData = rewriteHtmlToLocalAssets(gameData, siteDir);
+            const rewrittenGameData = prepareHtmlForOfflineReplay(gameData, siteDir);
             sseEvents.emit('update', { type: 'complete', html: rewrittenGameData, fromCache: false, path: urlObj.pathname, sitePath: siteDir, message: `Page captured with ${capturedRequests.length} assets: ${urlObj.pathname}` });
         } else {
             sseEvents.emit('update', { type: 'status', message: `Dependency refresh complete for cached page: ${urlObj.pathname}` });
