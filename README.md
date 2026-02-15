@@ -405,3 +405,5 @@ Note: local replay URL/script rewriting is enabled by default (`ENABLE_LOCAL_REP
 MHTML snapshot capture is best-effort; if `Page.captureSnapshot` fails on a site/browser build, capture continues and still saves HTML plus network assets.
 
 The viewer now tracks a page version and will not reload the iframe for duplicate `complete` updates unless the saved page content actually changed.
+
+Using saved cache now skips browser recapture by default, so opening an already-downloaded site does not relaunch Chromium unless cache is missing.

@@ -371,7 +371,7 @@ app.get('/', (req, res) => {
                 };
                 eventSource.onerror = function(err) {
                     console.error('EventSource failed:', err);
-                    document.getElementById('status').innerText = '⚠️ SSE blocked by tunnel/proxy, switching to polling updates...';
+                    document.getElementById('status').innerText = 'ℹ️ Using polling updates (SSE unavailable on this connection).';
                     ensurePolling();
                 };
 
@@ -583,13 +583,13 @@ async function captureSite(targetUrl) {
     if (hasCachedHtml) {
         cachedHtml = fs.readFileSync(siteFile, 'utf8');
         const cachedPageVersion = String(fs.statSync(siteFile).mtimeMs);
-        publishUpdate( { type: 'complete', fromCache: true, path: urlObj.pathname, sitePath: siteDir, pageVersion: cachedPageVersion, message: `Loaded cached HTML, refreshing dependencies: ${urlObj.pathname}` });
+        publishUpdate( { type: 'complete', fromCache: true, path: urlObj.pathname, sitePath: siteDir, pageVersion: cachedPageVersion, message: `Loaded from saved cache: ${urlObj.pathname}` });
+        publishUpdate( { type: 'status', message: 'Using saved site (browser refresh skipped).' });
+        return;
     }
 
-    // Refresh dependency capture every run while preserving existing cached HTML unless missing.
-    publishUpdate( { type: 'status', message: `Refreshing assets for ${targetUrl}...` });
-    console.log(`[FETCH] Refreshing dependency capture for: ${targetUrl}`);
     publishUpdate( { type: 'status', message: `Fetching new page: ${targetUrl}` });
+    console.log(`[FETCH] Capturing new page: ${targetUrl}`);
     let browser;
     let userDataDir = null;
     try {
