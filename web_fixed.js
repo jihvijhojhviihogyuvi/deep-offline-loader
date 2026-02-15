@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const archiver = require('archiver');
 const EventEmitter = require('events');
+const crypto = require('crypto');
 
 const app = express();
 const port = 8000;
@@ -15,6 +16,94 @@ app.use(express.json());
 
 const STORAGE_DIR = path.join(__dirname, 'saved_sites');
 if (!fs.existsSync(STORAGE_DIR)) fs.mkdirSync(STORAGE_DIR);
+
+
+
+function getAssetStoragePathForUrl(baseDir, url) {
+    const hash = crypto.createHash('sha1').update(url).digest('hex');
+    const parsed = new URL(url);
+    const safeHost = parsed.hostname.replace(/[^a-z0-9.-]/gi, '_');
+    const safePath = parsed.pathname.replace(/[^a-z0-9./_-]/gi, '_') || '/';
+    const normalizedPath = safePath.endsWith('/') ? `${safePath}index` : safePath;
+    const relativePath = normalizedPath.startsWith('/') ? normalizedPath.slice(1) : normalizedPath;
+    const extension = path.extname(relativePath) || '.bin';
+    const fileName = `${path.basename(relativePath, path.extname(relativePath)) || 'asset'}_${hash.slice(0, 12)}${extension}`;
+    return path.join(baseDir, safeHost, fileName);
+}
+
+function setupNetworkCapture(page, networkDir) {
+    const requests = [];
+    const pendingWrites = [];
+
+    page.on('response', (response) => {
+        const writeTask = (async () => {
+            const req = response.request();
+            const requestUrl = response.url();
+            if (!requestUrl.startsWith('http://') && !requestUrl.startsWith('https://')) return;
+
+            const targetPath = getAssetStoragePathForUrl(networkDir, requestUrl);
+            await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
+
+            let bodyPath = null;
+            let bodySize = 0;
+            try {
+                const body = await response.buffer();
+                bodySize = body.length;
+                bodyPath = `${targetPath}`;
+                await fs.promises.writeFile(bodyPath, body);
+            } catch (error) {
+                bodyPath = null;
+            }
+
+            requests.push({
+                url: requestUrl,
+                method: req.method(),
+                resourceType: req.resourceType(),
+                status: response.status(),
+                headers: response.headers(),
+                timestamp: new Date().toISOString(),
+                bodyPath,
+                bodySize
+            });
+        })();
+
+        pendingWrites.push(writeTask);
+    });
+
+    return {
+        async finalize() {
+            await Promise.allSettled(pendingWrites);
+            return requests;
+        }
+    };
+}
+
+
+function mergeNetworkManifests(existingEntries, newEntries) {
+    const mergedByKey = new Map();
+    [...existingEntries, ...newEntries].forEach((entry) => {
+        const key = `${entry.method || 'GET'}|${entry.url}|${entry.status}|${entry.resourceType}|${entry.bodySize || 0}`;
+        mergedByKey.set(key, entry);
+    });
+    return Array.from(mergedByKey.values());
+}
+
+function resolveBrowserExecutable() {
+    const candidates = [
+        process.env.PUPPETEER_EXECUTABLE_PATH,
+        '/usr/bin/chromium-browser',
+        '/usr/bin/chromium',
+        '/usr/bin/google-chrome',
+        '/usr/bin/google-chrome-stable'
+    ].filter(Boolean);
+
+    for (const candidate of candidates) {
+        if (fs.existsSync(candidate)) return candidate;
+    }
+
+    return null;
+}
+
 
 app.get('/events', (req, res) => {
     console.log('[SSE] Client connected to event stream.');
@@ -254,33 +343,43 @@ async function captureSite(targetUrl) {
     const safePath = urlObj.pathname.replace(/[^a-z0-9]/gi, '_');
     const siteDir = path.join(STORAGE_DIR, safeHostname, safePath);
     const siteFile = path.join(siteDir, 'index.html');
+    const snapshotFile = path.join(siteDir, 'snapshot.mhtml');
 
-    // 1. Check if this specific page exists
-    sseEvents.emit('update', { type: 'status', message: `Checking cache for ${targetUrl}...` });
-    if (fs.existsSync(siteFile)) {
-        console.log(`[LOCAL] Loading from: ${siteFile}`);
-        sseEvents.emit('update', { type: 'status', message: `Loading from cache: ${siteFile}` });
-        const savedHtml = fs.readFileSync(siteFile, 'utf8');
-        sseEvents.emit('update', { type: 'complete', html: savedHtml, fromCache: true, path: urlObj.pathname, sitePath: siteDir, message: `Loaded from cache: ${urlObj.pathname}` });
-        return;
+    const hasCachedHtml = fs.existsSync(siteFile);
+    let cachedHtml = null;
+    if (hasCachedHtml) {
+        cachedHtml = fs.readFileSync(siteFile, 'utf8');
+        sseEvents.emit('update', { type: 'complete', html: cachedHtml, fromCache: true, path: urlObj.pathname, sitePath: siteDir, message: `Loaded cached HTML, refreshing dependencies: ${urlObj.pathname}` });
     }
 
-    // 2. Otherwise, download it
-    console.log(`[FETCH] Capturing new page: ${targetUrl}`);
+    // Refresh dependency capture every run while preserving existing cached HTML unless missing.
+    sseEvents.emit('update', { type: 'status', message: `Refreshing assets for ${targetUrl}...` });
+    console.log(`[FETCH] Refreshing dependency capture for: ${targetUrl}`);
     sseEvents.emit('update', { type: 'status', message: `Fetching new page: ${targetUrl}` });
     let browser;
     try {
         sseEvents.emit('update', { type: 'status', message: 'Launching browser...' });
         console.log('[LOG] Launching browser...');
-        browser = await puppeteer.launch({ 
-            headless: true, 
-            executablePath: '/usr/bin/chromium-browser', // Specify the path to the system Chromium
+        const executablePath = resolveBrowserExecutable();
+        const launchOptions = {
+            headless: true,
             args: [
                 '--disable-web-security',
                 '--no-sandbox', // Required for Docker/some Linux environments
                 '--disable-setuid-sandbox' // Required for Docker/some Linux environments
-            ] 
-        });
+            ]
+        };
+
+        if (executablePath) {
+            launchOptions.executablePath = executablePath;
+            console.log(`[LOG] Using browser executable at ${executablePath}`);
+            sseEvents.emit('update', { type: 'status', message: `Using browser executable at ${executablePath}` });
+        } else {
+            console.log('[LOG] No system Chromium found, using Puppeteer default executable resolution.');
+            sseEvents.emit('update', { type: 'status', message: 'No system Chromium found, using Puppeteer default executable.' });
+        }
+
+        browser = await puppeteer.launch(launchOptions);
         console.log('[LOG] Browser launched.');
         sseEvents.emit('update', { type: 'status', message: 'Browser launched.' });
 
@@ -288,6 +387,11 @@ async function captureSite(targetUrl) {
         const page = await browser.newPage();
         console.log('[LOG] New page created.');
         sseEvents.emit('update', { type: 'status', message: 'New page created.' });
+
+        await page.setCacheEnabled(false);
+        const networkDir = path.join(siteDir, 'network_assets');
+        const networkCapture = setupNetworkCapture(page, networkDir);
+        sseEvents.emit('update', { type: 'status', message: 'Network capture enabled (saving all requested assets).' });
 
         sseEvents.emit('update', { type: 'status', message: 'Bypassing CSP...' });
         await page.setBypassCSP(true);
@@ -302,8 +406,71 @@ async function captureSite(targetUrl) {
         sseEvents.emit('update', { type: 'status', message: 'Navigation complete.' });
 
 
+        sseEvents.emit('update', { type: 'status', message: 'Inlining iframe content for offline use...' });
+        const mainFrame = page.mainFrame();
+        const frameDepth = (frame) => {
+            let depth = 0;
+            let current = frame;
+            while (current.parentFrame()) {
+                depth += 1;
+                current = current.parentFrame();
+            }
+            return depth;
+        };
+
+        const frameHtmlByUrl = new Map();
+        const nonMainFrames = page.frames().filter(frame => frame !== mainFrame);
+        nonMainFrames.sort((a, b) => frameDepth(b) - frameDepth(a));
+
+        for (const frame of nonMainFrames) {
+            const childSnapshots = frame.childFrames()
+                .map(child => ({ url: child.url(), html: frameHtmlByUrl.get(child.url()) }))
+                .filter(snapshot => snapshot.url && snapshot.html);
+
+            await frame.evaluate((snapshots) => {
+                const snapshotsByUrl = new Map();
+                snapshots.forEach(snapshot => {
+                    if (!snapshotsByUrl.has(snapshot.url)) snapshotsByUrl.set(snapshot.url, []);
+                    snapshotsByUrl.get(snapshot.url).push(snapshot.html);
+                });
+
+                document.querySelectorAll('iframe').forEach((iframe) => {
+                    const sourceUrl = iframe.src;
+                    const queue = snapshotsByUrl.get(sourceUrl);
+                    if (!queue || queue.length === 0) return;
+                    const html = queue.shift();
+                    iframe.setAttribute('data-offline-src', sourceUrl);
+                    iframe.setAttribute('srcdoc', html);
+                    iframe.removeAttribute('src');
+                });
+            }, childSnapshots);
+
+            const frameHtml = await frame.content();
+            if (frame.url() && frameHtml) frameHtmlByUrl.set(frame.url(), frameHtml);
+        }
+
         sseEvents.emit('update', { type: 'status', message: 'Evaluating page content...' });
-        const gameData = await page.evaluate(() => {
+        const topLevelChildSnapshots = mainFrame.childFrames()
+            .map(child => ({ url: child.url(), html: frameHtmlByUrl.get(child.url()) }))
+            .filter(snapshot => snapshot.url && snapshot.html);
+
+        const gameData = await page.evaluate((snapshots) => {
+            const snapshotsByUrl = new Map();
+            snapshots.forEach(snapshot => {
+                if (!snapshotsByUrl.has(snapshot.url)) snapshotsByUrl.set(snapshot.url, []);
+                snapshotsByUrl.get(snapshot.url).push(snapshot.html);
+            });
+
+            document.querySelectorAll('iframe').forEach((iframe) => {
+                const sourceUrl = iframe.src;
+                const queue = snapshotsByUrl.get(sourceUrl);
+                if (!queue || queue.length === 0) return;
+                const html = queue.shift();
+                iframe.setAttribute('data-offline-src', sourceUrl);
+                iframe.setAttribute('srcdoc', html);
+                iframe.removeAttribute('src');
+            });
+
             // Hijack links to keep them in our system
             document.querySelectorAll('a').forEach(link => {
                 link.onclick = (e) => {
@@ -312,18 +479,51 @@ async function captureSite(targetUrl) {
                 };
             });
             return document.documentElement.outerHTML;
-        });
+        }, topLevelChildSnapshots);
         console.log('[LOG] Page evaluated.');
-        sseEvents.emit('update', { type: 'status', message: 'Page content evaluated.' });
+        sseEvents.emit('update', { type: 'status', message: 'Page content evaluated with iframe content inlined.' });
+
+        sseEvents.emit('update', { type: 'status', message: 'Capturing full page snapshot (including iframe content)...' });
+        const cdpSession = await page.target().createCDPSession();
+        await cdpSession.send('Page.enable');
+        const snapshot = await cdpSession.send('Page.captureSnapshot', { format: 'mhtml' });
+        console.log('[LOG] Full MHTML snapshot captured.');
+        sseEvents.emit('update', { type: 'status', message: 'Full page snapshot captured.' });
+
+        sseEvents.emit('update', { type: 'status', message: 'Finalizing network asset capture...' });
+        const capturedRequests = await networkCapture.finalize();
+        const networkManifestFile = path.join(siteDir, 'network_manifest.json');
 
 
         // Ensure directories exist and save
         sseEvents.emit('update', { type: 'status', message: `Ensuring directory exists: ${siteDir}` });
         if (!fs.existsSync(siteDir)) fs.mkdirSync(siteDir, { recursive: true });
-        sseEvents.emit('update', { type: 'status', message: `Saving site to ${siteFile}` });
-        fs.writeFileSync(siteFile, gameData);
-        console.log(`[LOG] Site saved to ${siteFile}`);
-        sseEvents.emit('update', { type: 'status', message: `Site saved to ${siteFile}` });
+
+        const htmlToStore = hasCachedHtml && cachedHtml ? cachedHtml : gameData;
+        if (!hasCachedHtml) {
+            sseEvents.emit('update', { type: 'status', message: `Saving site to ${siteFile}` });
+            fs.writeFileSync(siteFile, htmlToStore);
+        } else {
+            sseEvents.emit('update', { type: 'status', message: 'Keeping cached HTML and updating dependency files only.' });
+        }
+
+        fs.writeFileSync(snapshotFile, snapshot.data);
+
+        let existingManifest = [];
+        if (fs.existsSync(networkManifestFile)) {
+            try {
+                existingManifest = JSON.parse(fs.readFileSync(networkManifestFile, 'utf8'));
+                if (!Array.isArray(existingManifest)) existingManifest = [];
+            } catch (error) {
+                existingManifest = [];
+            }
+        }
+
+        const mergedManifest = mergeNetworkManifests(existingManifest, capturedRequests);
+        fs.writeFileSync(networkManifestFile, JSON.stringify(mergedManifest, null, 2));
+
+        console.log(`[LOG] Dependency refresh complete for ${siteFile}`);
+        sseEvents.emit('update', { type: 'status', message: `Dependencies refreshed (${capturedRequests.length} new requests, ${mergedManifest.length} total tracked).` });
 
         sseEvents.emit('update', { type: 'status', message: 'Closing browser...' });
         await browser.close();
@@ -331,7 +531,11 @@ async function captureSite(targetUrl) {
         sseEvents.emit('update', { type: 'status', message: 'Browser closed.' });
 
 
-        sseEvents.emit('update', { type: 'complete', html: gameData, fromCache: false, path: urlObj.pathname, sitePath: siteDir, message: `Page captured: ${urlObj.pathname}` });
+        if (!hasCachedHtml) {
+            sseEvents.emit('update', { type: 'complete', html: gameData, fromCache: false, path: urlObj.pathname, sitePath: siteDir, message: `Page captured with ${capturedRequests.length} assets: ${urlObj.pathname}` });
+        } else {
+            sseEvents.emit('update', { type: 'status', message: `Dependency refresh complete for cached page: ${urlObj.pathname}` });
+        }
 
     } catch (error) {
         console.error('[ERROR] An error occurred during capture:', error);
