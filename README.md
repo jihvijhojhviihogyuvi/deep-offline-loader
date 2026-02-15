@@ -407,3 +407,5 @@ MHTML snapshot capture is best-effort; if `Page.captureSnapshot` fails on a site
 The viewer now tracks a page version and will not reload the iframe for duplicate `complete` updates unless the saved page content actually changed.
 
 Using saved cache now skips browser recapture by default, so opening an already-downloaded site does not relaunch Chromium unless cache is missing.
+
+UI now includes an `UPDATE PAGE` button that forces a recapture even when a saved cache exists; regular `LOAD & SAVE` uses cached page immediately when available.

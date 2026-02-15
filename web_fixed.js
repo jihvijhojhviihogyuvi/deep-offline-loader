@@ -275,6 +275,7 @@ app.get('/', (req, res) => {
             <div id="navbar">
                 <input type="text" id="urlInput" placeholder="Enter full URL (e.g. site.com/game)">
                 <button id="loadButton">LOAD & SAVE</button>
+                <button id="updateButton">UPDATE PAGE</button>
                 <button class="download-button" onclick="downloadCurrentSite()">DOWNLOAD CURRENT</button>
                 <div id="status">Ready</div>
             </div>
@@ -289,6 +290,7 @@ app.get('/', (req, res) => {
                 let currentRenderedPageVersion = null;
 
                 function applyUpdate(data) {
+                    if (activeRequestId && data.requestId && data.requestId !== activeRequestId) return;
                     const status = document.getElementById('status');
                     const iframe = document.getElementById('displayFrame');
 
@@ -377,12 +379,15 @@ app.get('/', (req, res) => {
 
                 document.addEventListener('DOMContentLoaded', () => {
                     const loadButton = document.getElementById('loadButton');
+                    const updateButton = document.getElementById('updateButton');
                     loadButton.addEventListener('click', () => loadGame());
+                    updateButton.addEventListener('click', () => loadGame(undefined, true));
                 });
 
                 let currentSitePath = null;
+                let activeRequestId = null;
 
-                async function loadGame(targetUrl) {
+                async function loadGame(targetUrl, forceRefresh = false) {
                     const url = targetUrl || document.getElementById('urlInput').value;
                     if (!url) return;
                     if (targetUrl) document.getElementById('urlInput').value = targetUrl;
@@ -390,9 +395,10 @@ app.get('/', (req, res) => {
                     const status = document.getElementById('status');
                     const iframe = document.getElementById('displayFrame');
 
-                    status.innerText = "⏳ Requesting capture...";
+                    status.innerText = forceRefresh ? "🔄 Requesting forced refresh..." : "⏳ Requesting capture...";
                     iframe.style.display = "none";
                     currentSitePath = null; // Reset on new load
+                    activeRequestId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
                     try {
                         await syncLatestEventCursor();
@@ -404,11 +410,11 @@ app.get('/', (req, res) => {
                                 'Accept': 'application/json',
                                 'ngrok-skip-browser-warning': 'true'
                             },
-                            body: JSON.stringify({ url })
+                            body: JSON.stringify({ url, requestId: activeRequestId, forceRefresh })
                         });
 
                         if (response.ok) {
-                            status.innerText = "📡 Server is capturing...";
+                            status.innerText = forceRefresh ? "📡 Server is refreshing page and assets..." : "📡 Server is capturing...";
                             // Further updates will come via SSE or polling fallback
                             ensurePolling();
                         } else {
@@ -553,20 +559,22 @@ app.get('/download-all-sites-DEPRECATED', async (req, res) => {
 // New endpoint to start the capture process in the background
 app.post('/capture-start', (req, res) => {
     const targetUrl = req.body.url;
-    console.log(`[API] /capture-start endpoint hit for URL: ${targetUrl}`);
+    const requestId = req.body.requestId || null;
+    const forceRefresh = Boolean(req.body.forceRefresh);
+    console.log(`[API] /capture-start endpoint hit for URL: ${targetUrl} (forceRefresh=${forceRefresh})`);
 
     // Immediately respond to the client that the capture has started
     res.json({ status: 'started', message: 'Capture process initiated.' });
 
     // Launch the capture process in the background
     setImmediate(async () => {
-        await captureSite(targetUrl);
+        await captureSite(targetUrl, requestId, forceRefresh);
     });
 });
 
-async function captureSite(targetUrl) {
+async function captureSite(targetUrl, requestId = null, forceRefresh = false) {
     console.log(`[CAPTURE] captureSite function started for URL: ${targetUrl}`);
-    publishUpdate( { type: 'status', message: `Starting capture for ${targetUrl}...` });
+    publishUpdate( { type: 'status', requestId, message: `Starting capture for ${targetUrl}...` });
 
     if (!targetUrl.startsWith('http')) targetUrl = 'https://' + targetUrl;
     
@@ -580,20 +588,23 @@ async function captureSite(targetUrl) {
 
     const hasCachedHtml = fs.existsSync(siteFile);
     let cachedHtml = null;
-    if (hasCachedHtml) {
+    if (hasCachedHtml && !forceRefresh) {
         cachedHtml = fs.readFileSync(siteFile, 'utf8');
         const cachedPageVersion = String(fs.statSync(siteFile).mtimeMs);
-        publishUpdate( { type: 'complete', fromCache: true, path: urlObj.pathname, sitePath: siteDir, pageVersion: cachedPageVersion, message: `Loaded from saved cache: ${urlObj.pathname}` });
-        publishUpdate( { type: 'status', message: 'Using saved site (browser refresh skipped).' });
+        publishUpdate( { type: 'complete', requestId, fromCache: true, path: urlObj.pathname, sitePath: siteDir, pageVersion: cachedPageVersion, message: `Loaded from saved cache: ${urlObj.pathname}` });
+        publishUpdate( { type: 'status', requestId, message: 'Using saved site (browser refresh skipped).' });
         return;
     }
 
-    publishUpdate( { type: 'status', message: `Fetching new page: ${targetUrl}` });
+    if (hasCachedHtml && forceRefresh) {
+        publishUpdate( { type: 'status', requestId, message: 'Forced refresh requested: recapturing page and assets.' });
+    }
+    publishUpdate( { type: 'status', requestId, message: `Fetching new page: ${targetUrl}` });
     console.log(`[FETCH] Capturing new page: ${targetUrl}`);
     let browser;
     let userDataDir = null;
     try {
-        publishUpdate( { type: 'status', message: 'Launching browser...' });
+        publishUpdate( { type: 'status', requestId, message: 'Launching browser...' });
         console.log('[LOG] Launching browser...');
         const executablePath = resolveBrowserExecutable();
         userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dol-puppeteer-profile-'));
@@ -610,40 +621,40 @@ async function captureSite(targetUrl) {
         if (executablePath) {
             launchOptions.executablePath = executablePath;
             console.log(`[LOG] Using browser executable at ${executablePath}`);
-            publishUpdate( { type: 'status', message: `Using browser executable at ${executablePath}` });
+            publishUpdate( { type: 'status', requestId, message: `Using browser executable at ${executablePath}` });
         } else {
             console.log('[LOG] No system Chromium found, using Puppeteer default executable resolution.');
-            publishUpdate( { type: 'status', message: 'No system Chromium found, using Puppeteer default executable.' });
+            publishUpdate( { type: 'status', requestId, message: 'No system Chromium found, using Puppeteer default executable.' });
         }
 
         browser = await puppeteer.launch(launchOptions);
         console.log('[LOG] Browser launched.');
-        publishUpdate( { type: 'status', message: 'Browser launched.' });
+        publishUpdate( { type: 'status', requestId, message: 'Browser launched.' });
 
-        publishUpdate( { type: 'status', message: 'Creating new page...' });
+        publishUpdate( { type: 'status', requestId, message: 'Creating new page...' });
         const page = await browser.newPage();
         console.log('[LOG] New page created.');
-        publishUpdate( { type: 'status', message: 'New page created.' });
+        publishUpdate( { type: 'status', requestId, message: 'New page created.' });
 
         await page.setCacheEnabled(false);
         const networkDir = path.join(siteDir, 'network_assets');
         const networkCapture = setupNetworkCapture(page, networkDir);
-        publishUpdate( { type: 'status', message: 'Network capture enabled (saving all requested assets).' });
+        publishUpdate( { type: 'status', requestId, message: 'Network capture enabled (saving all requested assets).' });
 
-        publishUpdate( { type: 'status', message: 'Bypassing CSP...' });
+        publishUpdate( { type: 'status', requestId, message: 'Bypassing CSP...' });
         await page.setBypassCSP(true);
         console.log('[LOG] Bypassing CSP.');
-        publishUpdate( { type: 'status', message: 'CSP bypassed.' });
+        publishUpdate( { type: 'status', requestId, message: 'CSP bypassed.' });
 
 
-        publishUpdate( { type: 'status', message: `Navigating to ${targetUrl}...` });
+        publishUpdate( { type: 'status', requestId, message: `Navigating to ${targetUrl}...` });
         console.log(`[LOG] Navigating to ${targetUrl}...`);
         await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 60000 });
         console.log('[LOG] Navigation complete.');
-        publishUpdate( { type: 'status', message: 'Navigation complete.' });
+        publishUpdate( { type: 'status', requestId, message: 'Navigation complete.' });
 
 
-        publishUpdate( { type: 'status', message: 'Evaluating page content...' });
+        publishUpdate( { type: 'status', requestId, message: 'Evaluating page content...' });
         const gameData = await page.evaluate(() => {
             // Hijack links to keep them in our system
             document.querySelectorAll('a').forEach(link => {
@@ -655,9 +666,9 @@ async function captureSite(targetUrl) {
             return document.documentElement.outerHTML;
         });
         console.log('[LOG] Page evaluated.');
-        publishUpdate( { type: 'status', message: 'Page content evaluated.' });
+        publishUpdate( { type: 'status', requestId, message: 'Page content evaluated.' });
 
-        publishUpdate( { type: 'status', message: 'Capturing full page snapshot (including iframe content)...' });
+        publishUpdate( { type: 'status', requestId, message: 'Capturing full page snapshot (including iframe content)...' });
         let snapshotData = null;
         try {
             const cdpSession = await page.target().createCDPSession();
@@ -665,27 +676,27 @@ async function captureSite(targetUrl) {
             const snapshot = await cdpSession.send('Page.captureSnapshot', { format: 'mhtml' });
             snapshotData = snapshot.data;
             console.log('[LOG] Full MHTML snapshot captured.');
-            publishUpdate( { type: 'status', message: 'Full page snapshot captured.' });
+            publishUpdate( { type: 'status', requestId, message: 'Full page snapshot captured.' });
         } catch (snapshotError) {
             console.warn('[WARN] MHTML snapshot failed, continuing without snapshot.mhtml:', snapshotError.message);
-            publishUpdate( { type: 'status', message: `MHTML snapshot unavailable (${snapshotError.message}). Continuing...` });
+            publishUpdate( { type: 'status', requestId, message: `MHTML snapshot unavailable (${snapshotError.message}). Continuing...` });
         }
 
-        publishUpdate( { type: 'status', message: 'Finalizing network asset capture...' });
+        publishUpdate( { type: 'status', requestId, message: 'Finalizing network asset capture...' });
         const capturedRequests = await networkCapture.finalize();
         const networkManifestFile = path.join(siteDir, 'network_manifest.json');
 
 
         // Ensure directories exist and save
-        publishUpdate( { type: 'status', message: `Ensuring directory exists: ${siteDir}` });
+        publishUpdate( { type: 'status', requestId, message: `Ensuring directory exists: ${siteDir}` });
         if (!fs.existsSync(siteDir)) fs.mkdirSync(siteDir, { recursive: true });
 
         const htmlToStore = hasCachedHtml && cachedHtml ? cachedHtml : gameData;
         if (!hasCachedHtml) {
-            publishUpdate( { type: 'status', message: `Saving site to ${siteFile}` });
+            publishUpdate( { type: 'status', requestId, message: `Saving site to ${siteFile}` });
             fs.writeFileSync(siteFile, htmlToStore);
         } else {
-            publishUpdate( { type: 'status', message: 'Keeping cached HTML and updating dependency files only.' });
+            publishUpdate( { type: 'status', requestId, message: 'Keeping cached HTML and updating dependency files only.' });
         }
 
         if (snapshotData) fs.writeFileSync(snapshotFile, snapshotData);
@@ -704,28 +715,28 @@ async function captureSite(targetUrl) {
         fs.writeFileSync(networkManifestFile, JSON.stringify(mergedManifest, null, 2));
 
         console.log(`[LOG] Dependency refresh complete for ${siteFile}`);
-        publishUpdate( { type: 'status', message: `Dependencies refreshed (${capturedRequests.length} new requests, ${mergedManifest.length} total tracked).` });
+        publishUpdate( { type: 'status', requestId, message: `Dependencies refreshed (${capturedRequests.length} new requests, ${mergedManifest.length} total tracked).` });
 
-        publishUpdate( { type: 'status', message: 'Closing browser...' });
+        publishUpdate( { type: 'status', requestId, message: 'Closing browser...' });
         await browser.close();
         browser = null;
         fs.rmSync(userDataDir, { recursive: true, force: true });
         console.log('[LOG] Browser closed.');
-        publishUpdate( { type: 'status', message: 'Browser closed.' });
+        publishUpdate( { type: 'status', requestId, message: 'Browser closed.' });
 
 
         if (!hasCachedHtml) {
             const savedPageVersion = String(fs.statSync(siteFile).mtimeMs);
-            publishUpdate( { type: 'complete', fromCache: false, path: urlObj.pathname, sitePath: siteDir, pageVersion: savedPageVersion, message: `Page captured with ${capturedRequests.length} assets: ${urlObj.pathname}` });
+            publishUpdate( { type: 'complete', requestId, fromCache: false, path: urlObj.pathname, sitePath: siteDir, pageVersion: savedPageVersion, message: `Page captured with ${capturedRequests.length} assets: ${urlObj.pathname}` });
         } else {
-            publishUpdate( { type: 'status', message: `Dependency refresh complete for cached page: ${urlObj.pathname}` });
+            publishUpdate( { type: 'status', requestId, message: `Dependency refresh complete for cached page: ${urlObj.pathname}` });
         }
 
     } catch (error) {
         console.error('[ERROR] An error occurred during capture:', error);
-        publishUpdate( { type: 'error', message: `Capture failed: ${error.message}` });
+        publishUpdate( { type: 'error', requestId, message: `Capture failed: ${error.message}` });
         if (browser) {
-            publishUpdate( { type: 'status', message: 'Closing browser due to error...' });
+            publishUpdate( { type: 'status', requestId, message: 'Closing browser due to error...' });
             await browser.close();
         }
         if (typeof userDataDir === 'string') {
