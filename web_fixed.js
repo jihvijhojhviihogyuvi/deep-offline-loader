@@ -224,14 +224,79 @@ function injectOfflineReplayScript(html, siteDir) {
     }
   };
 
+  const shouldRewrite = (value) => {
+    if (!value) return false;
+    const trimmed = String(value).trim();
+    if (!trimmed) return false;
+    if (trimmed.startsWith('#')) return false;
+    if (/^(data:|blob:|javascript:|mailto:|tel:)/i.test(trimmed)) return false;
+    return true;
+  };
+
   const rewriteNodeUrl = (node, attribute) => {
     const value = node.getAttribute(attribute);
-    if (!value) return;
+    if (!shouldRewrite(value)) return;
     node.setAttribute(attribute, toReplayUrl(value, 'GET'));
   };
 
-  document.querySelectorAll('[src]').forEach((node) => rewriteNodeUrl(node, 'src'));
-  document.querySelectorAll('[href]').forEach((node) => rewriteNodeUrl(node, 'href'));
+  const rewriteSrcSet = (node) => {
+    const srcset = node.getAttribute('srcset');
+    if (!srcset) return;
+    const rewritten = srcset
+      .split(',')
+      .map((part) => {
+        const trimmed = part.trim();
+        if (!trimmed) return trimmed;
+        const [url, descriptor] = trimmed.split(/\s+/, 2);
+        if (!shouldRewrite(url)) return trimmed;
+        return descriptor ? toReplayUrl(url, 'GET') + ' ' + descriptor : toReplayUrl(url, 'GET');
+      })
+      .join(', ');
+    node.setAttribute('srcset', rewritten);
+  };
+
+  const rewriteTree = (root) => {
+    if (!root || !root.querySelectorAll) return;
+    if (root.matches) {
+      if (root.hasAttribute && root.hasAttribute('src')) rewriteNodeUrl(root, 'src');
+      if (root.hasAttribute && root.hasAttribute('href')) rewriteNodeUrl(root, 'href');
+      if (root.hasAttribute && root.hasAttribute('action')) rewriteNodeUrl(root, 'action');
+      if (root.hasAttribute && root.hasAttribute('poster')) rewriteNodeUrl(root, 'poster');
+      if (root.hasAttribute && root.hasAttribute('srcset')) rewriteSrcSet(root);
+    }
+    root.querySelectorAll('[src]').forEach((node) => rewriteNodeUrl(node, 'src'));
+    root.querySelectorAll('[href]').forEach((node) => rewriteNodeUrl(node, 'href'));
+    root.querySelectorAll('[action]').forEach((node) => rewriteNodeUrl(node, 'action'));
+    root.querySelectorAll('[poster]').forEach((node) => rewriteNodeUrl(node, 'poster'));
+    root.querySelectorAll('[srcset]').forEach((node) => rewriteSrcSet(node));
+  };
+
+  rewriteTree(document.documentElement || document);
+
+  if (typeof MutationObserver === 'function') {
+    const observer = new MutationObserver((mutations) => {
+      mutations.forEach((mutation) => {
+        if (mutation.type === 'attributes' && mutation.target) {
+          const attr = mutation.attributeName;
+          if (attr === 'src' || attr === 'href' || attr === 'action' || attr === 'poster') {
+            rewriteNodeUrl(mutation.target, attr);
+          }
+          if (attr === 'srcset') rewriteSrcSet(mutation.target);
+        }
+        mutation.addedNodes.forEach((node) => {
+          if (node && node.nodeType === 1) rewriteTree(node);
+        });
+      });
+    });
+    observer.observe(document.documentElement || document, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['src', 'href', 'action', 'poster', 'srcset']
+    });
+  }
+
+  document.addEventListener('DOMContentLoaded', () => rewriteTree(document.documentElement || document));
 
   const originalFetch = window.fetch ? window.fetch.bind(window) : null;
   if (originalFetch) {
@@ -266,10 +331,63 @@ function injectOfflineReplayScript(html, siteDir) {
     return `${replayScript}${html}`;
 }
 
-function prepareHtmlForOfflineReplay(html, siteDir) {
+function rewriteHtmlAttributesToReplayProxy(html, siteDir, originalUrl) {
+    if (!ENABLE_LOCAL_REPLAY || !originalUrl) return html;
+
+    const shouldRewrite = (value) => {
+        if (!value) return false;
+        const trimmed = String(value).trim();
+        if (!trimmed || trimmed.startsWith('#')) return false;
+        if (/^(data:|blob:|javascript:|mailto:|tel:)/i.test(trimmed)) return false;
+        return true;
+    };
+
+    const toAbsolute = (value) => {
+        try {
+            return new URL(value, originalUrl).href;
+        } catch (error) {
+            return null;
+        }
+    };
+
+    const rewriteValue = (value, method = 'GET') => {
+        if (!shouldRewrite(value)) return value;
+        const absolute = toAbsolute(value);
+        if (!absolute || !/^https?:/i.test(absolute)) return value;
+        return makeReplayProxyUrl(siteDir, absolute, method);
+    };
+
+    let rewritten = html;
+    rewritten = rewritten.replace(/\b(src|href|poster)=(['"])(.*?)\2/gi, (match, attr, quote, value) => {
+        return `${attr}=${quote}${rewriteValue(value, 'GET')}${quote}`;
+    });
+
+    rewritten = rewritten.replace(/\baction=(['"])(.*?)\1/gi, (match, quote, value) => {
+        return `action=${quote}${rewriteValue(value, 'POST')}${quote}`;
+    });
+
+    rewritten = rewritten.replace(/\bsrcset=(['"])(.*?)\1/gi, (match, quote, value) => {
+        const updated = value
+            .split(',')
+            .map((part) => {
+                const trimmed = part.trim();
+                if (!trimmed) return trimmed;
+                const [rawUrl, descriptor] = trimmed.split(/\s+/, 2);
+                const transformed = rewriteValue(rawUrl, 'GET');
+                return descriptor ? `${transformed} ${descriptor}` : transformed;
+            })
+            .join(', ');
+        return `srcset=${quote}${updated}${quote}`;
+    });
+
+    return rewritten;
+}
+
+function prepareHtmlForOfflineReplay(html, siteDir, originalUrl = null) {
     if (!ENABLE_LOCAL_REPLAY) return html;
     const rewrittenKnown = rewriteHtmlToLocalAssets(html, siteDir);
-    const rewrittenProxy = rewriteHtmlToReplayProxy(rewrittenKnown, siteDir);
+    const rewrittenWithRelativeUrls = rewriteHtmlAttributesToReplayProxy(rewrittenKnown, siteDir, originalUrl);
+    const rewrittenProxy = rewriteHtmlToReplayProxy(rewrittenWithRelativeUrls, siteDir);
     return injectOfflineReplayScript(rewrittenProxy, siteDir);
 }
 
@@ -532,7 +650,7 @@ app.get('/view-site', (req, res) => {
 
     const savedHtml = fs.readFileSync(siteFile, 'utf8');
     const originalUrl = typeof req.query.url === 'string' ? req.query.url : null;
-    const preparedReplayHtml = prepareHtmlForOfflineReplay(savedHtml, sitePath);
+    const preparedReplayHtml = prepareHtmlForOfflineReplay(savedHtml, sitePath, originalUrl);
     const preparedHtml = injectBaseHref(preparedReplayHtml, originalUrl);
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     return res.send(preparedHtml);
