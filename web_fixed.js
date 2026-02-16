@@ -216,7 +216,11 @@ function injectOfflineReplayScript(html, siteDir) {
   const sitePath = ${JSON.stringify(siteDir)};
   const toReplayUrl = (rawUrl, method = 'GET') => {
     try {
-      const absolute = new URL(rawUrl, window.location.href);
+      if (!rawUrl) return rawUrl;
+      const text = String(rawUrl);
+      if (text.startsWith('/replay-resource?') || text.startsWith('/asset?')) return rawUrl;
+      const absolute = new URL(text, window.location.href);
+      if (/\/replay-resource\?/i.test(absolute.pathname + absolute.search) || /\/asset\?/i.test(absolute.pathname + absolute.search)) return rawUrl;
       if (!/^https?:$/i.test(absolute.protocol)) return rawUrl;
       return '/replay-resource?sitePath=' + encodeURIComponent(sitePath) + '&url=' + encodeURIComponent(absolute.href) + '&method=' + encodeURIComponent((method || 'GET').toUpperCase());
     } catch (_) {
@@ -352,6 +356,7 @@ function rewriteHtmlAttributesToReplayProxy(html, siteDir, originalUrl) {
 
     const rewriteValue = (value, method = 'GET') => {
         if (!shouldRewrite(value)) return value;
+        if (/^(\/replay-resource\?|\/asset\?)/i.test(value)) return value;
         const absolute = toAbsolute(value);
         if (!absolute || !/^https?:/i.test(absolute)) return value;
         return makeReplayProxyUrl(siteDir, absolute, method);
@@ -387,8 +392,7 @@ function prepareHtmlForOfflineReplay(html, siteDir, originalUrl = null) {
     if (!ENABLE_LOCAL_REPLAY) return html;
     const rewrittenKnown = rewriteHtmlToLocalAssets(html, siteDir);
     const rewrittenWithRelativeUrls = rewriteHtmlAttributesToReplayProxy(rewrittenKnown, siteDir, originalUrl);
-    const rewrittenProxy = rewriteHtmlToReplayProxy(rewrittenWithRelativeUrls, siteDir);
-    return injectOfflineReplayScript(rewrittenProxy, siteDir);
+    return injectOfflineReplayScript(rewrittenWithRelativeUrls, siteDir);
 }
 
 function isSafeSitePath(sitePath) {
@@ -422,12 +426,6 @@ function findSavedAsset(siteDir, requestedUrl, method = 'GET') {
 function makeReplayProxyUrl(siteDir, rawUrl, method = 'GET') {
     return `/replay-resource?sitePath=${encodeURIComponent(siteDir)}&url=${encodeURIComponent(rawUrl)}&method=${encodeURIComponent((method || 'GET').toUpperCase())}`;
 }
-
-function rewriteHtmlToReplayProxy(html, siteDir) {
-    if (!ENABLE_LOCAL_REPLAY) return html;
-    return html.replace(/https?:\/\/[^\s"'<>]+/gi, (match) => makeReplayProxyUrl(siteDir, match));
-}
-
 function escapeRegExp(text) {
     return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
