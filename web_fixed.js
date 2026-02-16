@@ -110,6 +110,26 @@ async function applyRequestPolicy(page, rootHostname) {
     });
 }
 
+
+function persistChromiumCache(userDataDir, siteDir) {
+    if (!userDataDir || !fs.existsSync(userDataDir)) return;
+    const targets = [
+        ['Default/Cache', 'browser_cache/Default/Cache'],
+        ['Default/Code Cache', 'browser_cache/Default/Code Cache'],
+        ['Default/Service Worker', 'browser_cache/Default/Service Worker'],
+        ['Default/IndexedDB', 'browser_cache/Default/IndexedDB'],
+        ['Default/Local Storage', 'browser_cache/Default/Local Storage']
+    ];
+
+    targets.forEach(([sourceRel, destRel]) => {
+        const source = path.join(userDataDir, sourceRel);
+        const dest = path.join(siteDir, destRel);
+        if (!fs.existsSync(source)) return;
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.cpSync(source, dest, { recursive: true, force: true });
+    });
+}
+
 function getAssetStoragePathForUrl(baseDir, url) {
     const hash = crypto.createHash('sha1').update(url).digest('hex');
     const parsed = new URL(url);
@@ -716,6 +736,8 @@ app.post('/capture', async (req, res) => {
             const page = await browser.newPage();
             await page.setCacheEnabled(false);
             await applyRequestPolicy(page, urlObj.hostname);
+            const networkDir = path.join(siteDir, 'network_assets');
+            const networkCapture = setupNetworkCapture(page, networkDir);
             await page.setBypassCSP(true);
             await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 60000 });
 
@@ -729,17 +751,46 @@ app.post('/capture', async (req, res) => {
                 return document.documentElement.outerHTML;
             });
 
+            let snapshotData = null;
+            try {
+                const cdpSession = await page.target().createCDPSession();
+                await cdpSession.send('Page.enable');
+                const snapshot = await cdpSession.send('Page.captureSnapshot', { format: 'mhtml' });
+                snapshotData = snapshot.data;
+            } catch (snapshotError) {
+                console.warn('[WARN] /capture snapshot unavailable:', snapshotError.message);
+            }
+
+            const capturedRequests = await networkCapture.finalize();
+            const networkManifestFile = path.join(siteDir, 'network_manifest.json');
             if (!fs.existsSync(siteDir)) fs.mkdirSync(siteDir, { recursive: true });
             fs.writeFileSync(siteFile, gameData);
+            if (snapshotData) fs.writeFileSync(path.join(siteDir, 'snapshot.mhtml'), snapshotData);
+
+            let existingManifest = [];
+            if (fs.existsSync(networkManifestFile)) {
+                try {
+                    existingManifest = JSON.parse(fs.readFileSync(networkManifestFile, 'utf8'));
+                    if (!Array.isArray(existingManifest)) existingManifest = [];
+                } catch (error) {
+                    existingManifest = [];
+                }
+            }
+            const mergedManifest = mergeNetworkManifests(existingManifest, capturedRequests);
+            fs.writeFileSync(networkManifestFile, JSON.stringify(mergedManifest, null, 2));
 
             await browser.close();
             browser = null;
+            persistChromiumCache(userDataDir, siteDir);
             fs.rmSync(userDataDir, { recursive: true, force: true });
 
             return res.json({ html: gameData, fromCache: false, path: urlObj.pathname, sitePath: siteDir });
         } catch (error) {
             if (browser) await browser.close();
-            if (typeof userDataDir === 'string') fs.rmSync(userDataDir, { recursive: true, force: true });
+            if (typeof userDataDir === 'string') {
+                persistChromiumCache(userDataDir, siteDir);
+                fs.rmSync(userDataDir, { recursive: true, force: true });
+            }
             return res.status(500).json({ error: error.message });
         }
     } catch (error) {
@@ -906,6 +957,7 @@ async function captureSite(targetUrl, requestId = null, forceRefresh = false) {
         publishUpdate( { type: 'status', requestId, message: 'Closing browser...' });
         await browser.close();
         browser = null;
+        persistChromiumCache(userDataDir, siteDir);
         fs.rmSync(userDataDir, { recursive: true, force: true });
         console.log('[LOG] Browser closed.');
         publishUpdate( { type: 'status', requestId, message: 'Browser closed.' });
@@ -926,6 +978,7 @@ async function captureSite(targetUrl, requestId = null, forceRefresh = false) {
             await browser.close();
         }
         if (typeof userDataDir === 'string') {
+            persistChromiumCache(userDataDir, siteDir);
             fs.rmSync(userDataDir, { recursive: true, force: true });
         }
     }
