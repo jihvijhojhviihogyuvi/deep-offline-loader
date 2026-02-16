@@ -411,3 +411,5 @@ Using saved cache now skips browser recapture by default, so opening an already-
 UI now includes an `UPDATE PAGE` button that forces a recapture even when a saved cache exists; regular `LOAD & SAVE` uses cached page immediately when available.
 
 Normal `LOAD & SAVE` now checks `/check-cache` first and directly opens `/view-site` for saved pages without starting a capture job, so cached pages stay stable and do not switch to background update flow unless you press `UPDATE PAGE`.
+
+Cached `/view-site` rendering now injects a `<base href="...">` (from the original page URL) so relative script/style/image paths resolve correctly instead of rendering a blank page.

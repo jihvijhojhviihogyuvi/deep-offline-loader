@@ -31,6 +31,16 @@ if (!fs.existsSync(STORAGE_DIR)) fs.mkdirSync(STORAGE_DIR);
 
 
 
+
+function injectBaseHref(html, originalUrl) {
+    if (!originalUrl) return html;
+    const baseTag = `<base href="${originalUrl}">`;
+    if (/<base\s+href=/i.test(html)) return html;
+    if (html.includes('</head>')) return html.replace('</head>', `${baseTag}</head>`);
+    if (/<html[^>]*>/i.test(html)) return html.replace(/<html[^>]*>/i, (tag) => `${tag}<head>${baseTag}</head>`);
+    return `${baseTag}${html}`;
+}
+
 function buildSitePaths(targetUrl) {
     let normalizedUrl = targetUrl;
     if (!normalizedUrl.startsWith('http')) normalizedUrl = 'https://' + normalizedUrl;
@@ -318,7 +328,8 @@ app.get('/', (req, res) => {
 
                         if (shouldReloadFrame) {
                             if (data.sitePath) {
-                                iframe.src = '/view-site?sitePath=' + encodeURIComponent(data.sitePath);
+                                const originalUrlParam = data.originalUrl ? '&url=' + encodeURIComponent(data.originalUrl) : '';
+                                iframe.src = '/view-site?sitePath=' + encodeURIComponent(data.sitePath) + originalUrlParam;
                             } else if (data.html) {
                                 iframe.srcdoc = data.html;
                             }
@@ -429,7 +440,7 @@ app.get('/', (req, res) => {
                                 const cacheResult = await cacheResponse.json();
                                 if (cacheResult.hit && cacheResult.sitePath) {
                                     iframe.style.display = 'block';
-                                    iframe.src = '/view-site?sitePath=' + encodeURIComponent(cacheResult.sitePath);
+                                    iframe.src = '/view-site?sitePath=' + encodeURIComponent(cacheResult.sitePath) + '&url=' + encodeURIComponent(url.startsWith('http') ? url : 'https://' + url);
                                     currentSitePath = cacheResult.sitePath;
                                     currentRenderedSitePath = cacheResult.sitePath;
                                     currentRenderedPageVersion = cacheResult.pageVersion || null;
@@ -488,7 +499,9 @@ app.get('/view-site', (req, res) => {
     }
 
     const savedHtml = fs.readFileSync(siteFile, 'utf8');
-    const preparedHtml = prepareHtmlForOfflineReplay(savedHtml, sitePath);
+    const originalUrl = typeof req.query.url === 'string' ? req.query.url : null;
+    const withBaseHref = injectBaseHref(savedHtml, originalUrl);
+    const preparedHtml = prepareHtmlForOfflineReplay(withBaseHref, sitePath);
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     return res.send(preparedHtml);
 });
@@ -599,13 +612,13 @@ app.post('/check-cache', (req, res) => {
         const targetUrl = req.body.url;
         if (!targetUrl) return res.status(400).json({ hit: false, message: 'Missing url.' });
 
-        const { urlObj, siteDir, siteFile } = buildSitePaths(targetUrl);
+        const { normalizedUrl, urlObj, siteDir, siteFile } = buildSitePaths(targetUrl);
         const hit = fs.existsSync(siteFile);
 
         if (!hit) return res.json({ hit: false });
 
         const pageVersion = String(fs.statSync(siteFile).mtimeMs);
-        return res.json({ hit: true, sitePath: siteDir, path: urlObj.pathname, pageVersion });
+        return res.json({ hit: true, sitePath: siteDir, path: urlObj.pathname, pageVersion, originalUrl: normalizedUrl });
     } catch (error) {
         return res.status(400).json({ hit: false, message: error.message });
     }
@@ -640,7 +653,7 @@ async function captureSite(targetUrl, requestId = null, forceRefresh = false) {
     if (hasCachedHtml && !forceRefresh) {
         cachedHtml = fs.readFileSync(siteFile, 'utf8');
         const cachedPageVersion = String(fs.statSync(siteFile).mtimeMs);
-        publishUpdate( { type: 'complete', requestId, fromCache: true, path: urlObj.pathname, sitePath: siteDir, pageVersion: cachedPageVersion, message: `Loaded from saved cache: ${urlObj.pathname}` });
+        publishUpdate( { type: 'complete', requestId, fromCache: true, path: urlObj.pathname, sitePath: siteDir, originalUrl: targetUrl, pageVersion: cachedPageVersion, message: `Loaded from saved cache: ${urlObj.pathname}` });
         publishUpdate( { type: 'status', requestId, message: 'Using saved site (browser refresh skipped).' });
         return;
     }
@@ -776,7 +789,7 @@ async function captureSite(targetUrl, requestId = null, forceRefresh = false) {
 
         if (!hasCachedHtml) {
             const savedPageVersion = String(fs.statSync(siteFile).mtimeMs);
-            publishUpdate( { type: 'complete', requestId, fromCache: false, path: urlObj.pathname, sitePath: siteDir, pageVersion: savedPageVersion, message: `Page captured with ${capturedRequests.length} assets: ${urlObj.pathname}` });
+            publishUpdate( { type: 'complete', requestId, fromCache: false, path: urlObj.pathname, sitePath: siteDir, originalUrl: targetUrl, pageVersion: savedPageVersion, message: `Page captured with ${capturedRequests.length} assets: ${urlObj.pathname}` });
         } else {
             publishUpdate( { type: 'status', requestId, message: `Dependency refresh complete for cached page: ${urlObj.pathname}` });
         }
