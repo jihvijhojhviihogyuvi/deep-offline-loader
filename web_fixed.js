@@ -90,7 +90,10 @@ function shouldBlockRequestUrl(requestUrl, rootHostname) {
         }
 
         const isFirstParty = host === root || host.endsWith(`.${root}`) || (baseRoot && baseHost === baseRoot);
-        return !isFirstParty;
+        if (isFirstParty) return false;
+
+        // Allow non-ad/tracker third-party resources (CDNs/payment/game backends) for compatibility.
+        return false;
     } catch (error) {
         return false;
     }
@@ -369,6 +372,35 @@ app.get('/', (req, res) => {
                     updateButton.addEventListener('click', () => loadGame(undefined, true));
                 });
 
+                async function loadFromCacheOnly(url, status, iframe) {
+                    const cacheResponse = await fetch('/check-cache', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Accept': 'application/json',
+                            'ngrok-skip-browser-warning': 'true'
+                        },
+                        body: JSON.stringify({ url })
+                    });
+
+                    if (!cacheResponse.ok) {
+                        status.innerText = "❌ Cache check failed. Choose another site.";
+                        return true;
+                    }
+
+                    const cacheResult = await cacheResponse.json();
+                    if (cacheResult.hit && cacheResult.sitePath) {
+                        iframe.style.display = 'block';
+                        iframe.src = '/view-site?sitePath=' + encodeURIComponent(cacheResult.sitePath) + '&url=' + encodeURIComponent(url.startsWith('http') ? url : 'https://' + url);
+                        currentSitePath = cacheResult.sitePath;
+                        status.innerText = "📁 [LOCAL] " + (cacheResult.path || '/');
+                        return true;
+                    }
+
+                    status.innerText = "ℹ️ Offline and this site is not saved. Choose another site.";
+                    return true;
+                }
+
                 async function loadGame(targetUrl, forceRefresh = false) {
                     const url = targetUrl || document.getElementById('urlInput').value;
                     if (!url) return;
@@ -382,6 +414,15 @@ app.get('/', (req, res) => {
                     currentSitePath = null;
 
                     try {
+                        if (!navigator.onLine) {
+                            if (forceRefresh) {
+                                status.innerText = "ℹ️ Offline mode: cannot update right now. Choose another site or reconnect.";
+                                return;
+                            }
+                            await loadFromCacheOnly(url, status, iframe);
+                            return;
+                        }
+
                         const response = await fetch('/capture', {
                             method: 'POST',
                             headers: {

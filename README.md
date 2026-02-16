@@ -421,3 +421,5 @@ While viewing a cached page, background/polled capture events are ignored unless
 The main `LOAD & SAVE` flow now uses `POST /capture` (request/response) with immediate cache return semantics: if `saved_sites/.../index.html` exists and update is not forced, it returns cached HTML directly without starting background capture.
 
 Capture now blocks third-party ad/tracker domains and non-first-party requests by default, so saved assets focus on site-required resources instead of downloading random ad/analytics content.
+
+Frontend load behavior now uses direct `POST /capture` responses (no dependency on SSE/poll for rendering): cached pages are returned immediately, and offline mode attempts cache-only load and shows "choose another site" when not saved.
