@@ -132,31 +132,59 @@ function persistChromiumCache(userDataDir, siteDir) {
     });
 }
 
-function getAssetStoragePathForUrl(baseDir, url) {
+function extensionFromContentType(contentType) {
+    const normalized = String(contentType || '').toLowerCase().split(';')[0].trim();
+    const map = {
+        'image/png': '.png',
+        'image/jpeg': '.jpg',
+        'image/jpg': '.jpg',
+        'image/webp': '.webp',
+        'image/gif': '.gif',
+        'image/svg+xml': '.svg',
+        'image/x-icon': '.ico',
+        'image/avif': '.avif',
+        'text/css': '.css',
+        'application/javascript': '.js',
+        'text/javascript': '.js',
+        'application/json': '.json',
+        'text/html': '.html',
+        'font/woff': '.woff',
+        'font/woff2': '.woff2',
+        'application/wasm': '.wasm',
+        'audio/mpeg': '.mp3',
+        'audio/ogg': '.ogg',
+        'video/mp4': '.mp4'
+    };
+    return map[normalized] || null;
+}
+
+function getAssetStoragePathForUrl(baseDir, url, contentType = null) {
     const hash = crypto.createHash('sha1').update(url).digest('hex');
     const parsed = new URL(url);
     const safeHost = parsed.hostname.replace(/[^a-z0-9.-]/gi, '_');
     const safePath = parsed.pathname.replace(/[^a-z0-9./_-]/gi, '_') || '/';
     const normalizedPath = safePath.endsWith('/') ? `${safePath}index` : safePath;
     const relativePath = normalizedPath.startsWith('/') ? normalizedPath.slice(1) : normalizedPath;
-    const extension = path.extname(relativePath) || '.bin';
+    const pathExt = path.extname(relativePath);
+    const inferredExt = extensionFromContentType(contentType);
+    const extension = pathExt || inferredExt || '.bin';
     const fileName = `${path.basename(relativePath, path.extname(relativePath)) || 'asset'}_${hash.slice(0, 12)}${extension}`;
     return path.join(baseDir, safeHost, fileName);
 }
 
 
-async function warmupPageForOfflineCapture(page, extraWaitMs = 15000) {
+async function warmupPageForOfflineCapture(page, extraWaitMs = 15000, getCapturedCount = null) {
     const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
     try {
-        await wait(1000);
+        await wait(600);
         await page.evaluate(async () => {
             const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
             const maxY = Math.max(document.body ? document.body.scrollHeight : 0, document.documentElement ? document.documentElement.scrollHeight : 0, window.innerHeight || 0);
-            const points = [0, Math.floor(maxY * 0.25), Math.floor(maxY * 0.5), Math.floor(maxY * 0.75), maxY, 0];
+            const points = [0, Math.floor(maxY * 0.35), Math.floor(maxY * 0.7), maxY, 0];
             for (const point of points) {
                 window.scrollTo(0, point);
-                await delay(400);
+                await delay(250);
             }
         });
     } catch (error) {
@@ -176,18 +204,35 @@ async function warmupPageForOfflineCapture(page, extraWaitMs = 15000) {
         }
     }
 
-    const end = Date.now() + Math.max(0, extraWaitMs);
+    const maxWait = Math.max(0, extraWaitMs);
+    const minWaitBeforeFastExit = Math.min(maxWait, 5000);
+    const end = Date.now() + maxWait;
+    let idleStreak = 0;
+    let lastCount = typeof getCapturedCount === 'function' ? getCapturedCount() : 0;
+
     while (Date.now() < end) {
-        const slice = Math.min(2500, end - Date.now());
+        const slice = Math.min(2200, end - Date.now());
         if (slice <= 0) break;
         try {
             if (typeof page.waitForNetworkIdle === 'function') {
-                await page.waitForNetworkIdle({ idleTime: 750, timeout: slice });
+                await page.waitForNetworkIdle({ idleTime: 650, timeout: slice });
             } else {
                 await wait(slice);
             }
         } catch (error) {
             await wait(slice);
+        }
+
+        const elapsed = maxWait - (end - Date.now());
+        if (typeof getCapturedCount === 'function' && elapsed >= minWaitBeforeFastExit) {
+            const currentCount = getCapturedCount();
+            if (currentCount === lastCount) {
+                idleStreak += 1;
+            } else {
+                idleStreak = 0;
+                lastCount = currentCount;
+            }
+            if (idleStreak >= 2) break;
         }
     }
 }
@@ -203,7 +248,8 @@ function setupNetworkCapture(page, networkDir) {
             if (!requestUrl.startsWith('http://') && !requestUrl.startsWith('https://')) return;
 
             const headers = response.headers();
-            const targetPath = getAssetStoragePathForUrl(networkDir, requestUrl);
+            const responseContentType = headers['content-type'] || headers['Content-Type'] || '';
+            const targetPath = getAssetStoragePathForUrl(networkDir, requestUrl, responseContentType);
             await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
 
             let bodyPath = null;
@@ -268,6 +314,9 @@ function setupNetworkCapture(page, networkDir) {
     });
 
     return {
+        getCapturedCount() {
+            return requests.length;
+        },
         async finalize() {
             await Promise.allSettled(pendingWrites);
             return requests;
@@ -1043,7 +1092,7 @@ app.post('/capture', async (req, res) => {
             console.log(`[CAPTURE] Navigating with timeout=${CAPTURE_NAV_TIMEOUT_MS}ms url=${targetUrl}`);
             await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: CAPTURE_NAV_TIMEOUT_MS });
             console.log(`[CAPTURE] Warmup for ${CAPTURE_WARMUP_MS}ms url=${targetUrl}`);
-            await warmupPageForOfflineCapture(page, CAPTURE_WARMUP_MS);
+            await warmupPageForOfflineCapture(page, CAPTURE_WARMUP_MS, () => networkCapture.getCapturedCount());
 
             const gameData = await page.evaluate(() => {
                 document.querySelectorAll('a').forEach(link => {
@@ -1199,7 +1248,7 @@ async function captureSite(targetUrl, requestId = null, forceRefresh = false) {
         await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: CAPTURE_NAV_TIMEOUT_MS });
         publishUpdate( { type: 'status', requestId, message: `Running deep warmup (${CAPTURE_WARMUP_MS}ms) to trigger lazy game assets...` });
         console.log(`[CAPTURE] Warmup for ${CAPTURE_WARMUP_MS}ms url=${targetUrl}`);
-        await warmupPageForOfflineCapture(page, CAPTURE_WARMUP_MS);
+        await warmupPageForOfflineCapture(page, CAPTURE_WARMUP_MS, () => networkCapture.getCapturedCount());
         console.log('[LOG] Navigation complete.');
         publishUpdate( { type: 'status', requestId, message: 'Navigation complete.' });
 
