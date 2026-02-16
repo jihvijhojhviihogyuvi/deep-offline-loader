@@ -493,11 +493,22 @@ function rewriteHtmlAttributesToReplayProxy(html, siteDir, originalUrl) {
         }
     };
 
+    let localAssetRewriteCount = 0;
+    let replayProxyRewriteCount = 0;
+
     const rewriteValue = (value, method = 'GET') => {
         if (!shouldRewrite(value)) return value;
         if (/^(\/replay-resource\?|\/asset\?)/i.test(value)) return value;
         const absolute = toAbsolute(value);
         if (!absolute || !/^https?:/i.test(absolute)) return value;
+
+        const localAsset = findSavedAsset(siteDir, absolute, method);
+        if (localAsset && localAsset.bodyPath && fs.existsSync(localAsset.bodyPath)) {
+            localAssetRewriteCount += 1;
+            return makeLocalAssetUrl(siteDir, absolute, method);
+        }
+
+        replayProxyRewriteCount += 1;
         return makeReplayProxyUrl(siteDir, absolute, method);
     };
 
@@ -524,6 +535,7 @@ function rewriteHtmlAttributesToReplayProxy(html, siteDir, originalUrl) {
         return `srcset=${quote}${updated}${quote}`;
     });
 
+    console.log(`[VIEW] Rewrote URLs for ${siteDir} localAsset=${localAssetRewriteCount} replayProxy=${replayProxyRewriteCount}`);
     return rewritten;
 }
 
@@ -564,6 +576,10 @@ function findSavedAsset(siteDir, requestedUrl, method = 'GET') {
 
 function makeReplayProxyUrl(siteDir, rawUrl, method = 'GET') {
     return `/replay-resource?sitePath=${encodeURIComponent(siteDir)}&url=${encodeURIComponent(rawUrl)}&method=${encodeURIComponent((method || 'GET').toUpperCase())}`;
+}
+
+function makeLocalAssetUrl(siteDir, rawUrl, method = 'GET') {
+    return `/asset?sitePath=${encodeURIComponent(siteDir)}&url=${encodeURIComponent(rawUrl)}&method=${encodeURIComponent((method || 'GET').toUpperCase())}`;
 }
 function escapeRegExp(text) {
     return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
