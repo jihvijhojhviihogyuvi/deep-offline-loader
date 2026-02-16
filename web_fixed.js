@@ -200,6 +200,7 @@ function setupNetworkCapture(page, networkDir) {
             const requestUrl = response.url();
             if (!requestUrl.startsWith('http://') && !requestUrl.startsWith('https://')) return;
 
+            const headers = response.headers();
             const targetPath = getAssetStoragePathForUrl(networkDir, requestUrl);
             await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
 
@@ -214,19 +215,54 @@ function setupNetworkCapture(page, networkDir) {
                 bodyPath = null;
             }
 
-            requests.push({
+            const entry = {
                 url: requestUrl,
                 method: req.method(),
                 resourceType: req.resourceType(),
                 status: response.status(),
-                headers: response.headers(),
+                headers,
                 timestamp: new Date().toISOString(),
                 bodyPath,
                 bodySize
-            });
+            };
+            requests.push(entry);
+
+            if (bodyPath) {
+                try {
+                    const parsed = new URL(requestUrl);
+                    const isStaticLike = ['image', 'stylesheet', 'script', 'font', 'media'].includes(req.resourceType()) || /^image\//i.test(headers['content-type'] || '') || /^font\//i.test(headers['content-type'] || '');
+                    if (isStaticLike && parsed.search) {
+                        requests.push({
+                            ...entry,
+                            url: `${parsed.origin}${parsed.pathname}`,
+                            aliasOf: requestUrl
+                        });
+                    }
+                } catch (_) {
+                    // Ignore alias generation errors.
+                }
+            }
         })();
 
         pendingWrites.push(writeTask);
+    });
+
+    page.on('requestfailed', (request) => {
+        const failure = request.failure();
+        const requestUrl = request.url();
+        if (!requestUrl.startsWith('http://') && !requestUrl.startsWith('https://')) return;
+        requests.push({
+            url: requestUrl,
+            method: request.method(),
+            resourceType: request.resourceType(),
+            status: 0,
+            headers: {},
+            timestamp: new Date().toISOString(),
+            bodyPath: null,
+            bodySize: 0,
+            failed: true,
+            failureText: failure ? failure.errorText : 'unknown'
+        });
     });
 
     return {
@@ -237,6 +273,24 @@ function setupNetworkCapture(page, networkDir) {
     };
 }
 
+function normalizeCapturedUrl(rawUrl) {
+    try {
+        const parsed = new URL(rawUrl);
+        parsed.hash = '';
+        return parsed.toString();
+    } catch (error) {
+        return String(rawUrl || '');
+    }
+}
+
+function urlWithoutSearch(rawUrl) {
+    try {
+        const parsed = new URL(rawUrl);
+        return `${parsed.origin}${parsed.pathname}`;
+    } catch (error) {
+        return String(rawUrl || '');
+    }
+}
 
 function mergeNetworkManifests(existingEntries, newEntries) {
     const mergedByKey = new Map();
@@ -251,9 +305,46 @@ function mergeNetworkManifests(existingEntries, newEntries) {
 
 function findAssetEntry(manifest, requestedUrl, method = 'GET') {
     const normalizedMethod = (method || 'GET').toUpperCase();
-    const exactMethod = manifest.find((entry) => entry.url === requestedUrl && (entry.method || 'GET').toUpperCase() === normalizedMethod && entry.bodyPath && fs.existsSync(entry.bodyPath));
-    if (exactMethod) return exactMethod;
-    return manifest.find((entry) => entry.url === requestedUrl && entry.bodyPath && fs.existsSync(entry.bodyPath));
+    const requestedNormalized = normalizeCapturedUrl(requestedUrl);
+    const requestedNoSearch = urlWithoutSearch(requestedNormalized);
+
+    const candidates = [
+        requestedUrl,
+        requestedNormalized,
+        requestedNoSearch
+    ];
+
+    const exists = (entry) => entry && entry.bodyPath && fs.existsSync(entry.bodyPath);
+    for (const candidate of candidates) {
+        const exactMethod = manifest.find((entry) => entry.url === candidate && (entry.method || 'GET').toUpperCase() === normalizedMethod && exists(entry));
+        if (exactMethod) return exactMethod;
+    }
+
+    for (const candidate of candidates) {
+        const anyMethod = manifest.find((entry) => entry.url === candidate && exists(entry));
+        if (anyMethod) return anyMethod;
+    }
+
+    try {
+        const req = new URL(requestedNormalized);
+        const pathnameMatch = manifest.find((entry) => {
+            if (!exists(entry)) return false;
+            try {
+                const candidate = new URL(entry.url);
+                if (`${candidate.origin}${candidate.pathname}` !== `${req.origin}${req.pathname}`) return false;
+                const resourceType = String(entry.resourceType || '').toLowerCase();
+                const contentType = String((entry.headers && (entry.headers['content-type'] || entry.headers['Content-Type'])) || '').toLowerCase();
+                return ['image', 'stylesheet', 'script', 'font', 'media'].includes(resourceType) || contentType.startsWith('image/') || contentType.startsWith('font/');
+            } catch (_) {
+                return false;
+            }
+        });
+        if (pathnameMatch) return pathnameMatch;
+    } catch (_) {
+        // ignore
+    }
+
+    return null;
 }
 
 function injectOfflineReplayScript(html, siteDir) {
@@ -759,10 +850,14 @@ app.all('/replay-resource', async (req, res) => {
     const method = (req.query.method || req.method || 'GET').toUpperCase();
 
     if (!isSafeSitePath(sitePath) || !requestedUrl) {
+        console.warn(`[REPLAY] Invalid request. sitePath=${sitePath} url=${requestedUrl}`);
         return res.status(400).send('Invalid replay request.');
     }
 
+    console.log(`[REPLAY] ${method} ${requestedUrl}`);
+
     if (shouldBlockRequestUrl(requestedUrl, new URL(requestedUrl).hostname)) {
+        console.log(`[REPLAY] Blocked by policy: ${requestedUrl}`);
         return res.status(204).end();
     }
 
@@ -772,8 +867,11 @@ app.all('/replay-resource', async (req, res) => {
         if (!resolved.startsWith(sitePath)) return res.status(400).send('Invalid cached path.');
         const contentType = cached.headers && (cached.headers['content-type'] || cached.headers['Content-Type']);
         if (contentType) res.setHeader('Content-Type', contentType);
+        console.log(`[REPLAY] HIT ${method} ${requestedUrl} -> ${resolved}`);
         return res.sendFile(resolved);
     }
+
+    console.warn(`[REPLAY] MISS ${method} ${requestedUrl} (attempting network fetch)`);
 
     try {
         const response = await fetch(requestedUrl, { method: method === 'GET' ? 'GET' : method });
@@ -798,9 +896,17 @@ app.all('/replay-resource', async (req, res) => {
 
         const contentType = headers['content-type'];
         if (contentType) res.setHeader('Content-Type', contentType);
+        console.log(`[REPLAY] FETCHED ${method} ${requestedUrl} status=${response.status} bytes=${buf.length}`);
         return res.status(response.status).send(buf);
     } catch (error) {
-        return res.status(502).send('Replay fetch failed');
+        console.error(`[REPLAY] FETCH FAILED ${method} ${requestedUrl}: ${error.message}`);
+        return res.status(502).json({
+            error: 'Replay fetch failed',
+            message: error.message,
+            url: requestedUrl,
+            method,
+            hint: 'Asset was not captured and network fetch failed (often due to offline mode). Re-capture while online.'
+        });
     }
 });
 
@@ -816,6 +922,7 @@ app.get('/asset', (req, res) => {
     const assetEntry = findAssetEntry(manifest, requestedUrl, req.query.method || 'GET');
 
     if (!assetEntry) {
+        console.warn(`[ASSET] MISS ${requestedUrl}`);
         return res.status(404).send('Asset not found.');
     }
 
@@ -826,6 +933,7 @@ app.get('/asset', (req, res) => {
 
     const contentType = assetEntry.headers && (assetEntry.headers['content-type'] || assetEntry.headers['Content-Type']);
     if (contentType) res.setHeader('Content-Type', contentType);
+    console.log(`[ASSET] HIT ${requestedUrl} -> ${resolvedAssetPath}`);
     return res.sendFile(resolvedAssetPath);
 });
 
@@ -950,6 +1058,11 @@ app.post('/capture', async (req, res) => {
             }
             const mergedManifest = mergeNetworkManifests(existingManifest, capturedRequests);
             fs.writeFileSync(networkManifestFile, JSON.stringify(mergedManifest, null, 2));
+
+            const savedBodies = capturedRequests.filter((entry) => entry.bodyPath).length;
+            const failedRequests = capturedRequests.filter((entry) => entry.failed).length;
+            const imageEntries = capturedRequests.filter((entry) => String(entry.resourceType || '').toLowerCase() === 'image' || String((entry.headers && (entry.headers['content-type'] || entry.headers['Content-Type'])) || '').toLowerCase().startsWith('image/')).length;
+            console.log(`[CAPTURE] Completed ${targetUrl} | captured=${capturedRequests.length} savedBodies=${savedBodies} images=${imageEntries} failed=${failedRequests} manifestTotal=${mergedManifest.length}`);
 
             await browser.close();
             browser = null;
@@ -1125,6 +1238,10 @@ async function captureSite(targetUrl, requestId = null, forceRefresh = false) {
         const mergedManifest = mergeNetworkManifests(existingManifest, capturedRequests);
         fs.writeFileSync(networkManifestFile, JSON.stringify(mergedManifest, null, 2));
 
+        const savedBodies = capturedRequests.filter((entry) => entry.bodyPath).length;
+        const failedRequests = capturedRequests.filter((entry) => entry.failed).length;
+        const imageEntries = capturedRequests.filter((entry) => String(entry.resourceType || '').toLowerCase() === 'image' || String((entry.headers && (entry.headers['content-type'] || entry.headers['Content-Type'])) || '').toLowerCase().startsWith('image/')).length;
+        console.log(`[CAPTURE] Background completed ${targetUrl} | captured=${capturedRequests.length} savedBodies=${savedBodies} images=${imageEntries} failed=${failedRequests} manifestTotal=${mergedManifest.length}`);
         console.log(`[LOG] Dependency refresh complete for ${siteFile}`);
         publishUpdate( { type: 'status', requestId, message: `Dependencies refreshed (${capturedRequests.length} new requests, ${mergedManifest.length} total tracked).` });
 
