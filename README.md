@@ -419,3 +419,5 @@ When loading from cache, SSE fallback notices no longer overwrite the local-load
 While viewing a cached page, background/polled capture events are ignored unless a new capture is explicitly started, preventing unwanted recapture UI churn.
 
 The main `LOAD & SAVE` flow now uses `POST /capture` (request/response) with immediate cache return semantics: if `saved_sites/.../index.html` exists and update is not forced, it returns cached HTML directly without starting background capture.
+
+Capture now blocks third-party ad/tracker domains and non-first-party requests by default, so saved assets focus on site-required resources instead of downloading random ad/analytics content.

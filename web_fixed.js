@@ -54,6 +54,59 @@ function buildSitePaths(targetUrl) {
     return { normalizedUrl, urlObj, siteDir, siteFile };
 }
 
+
+function getBaseDomain(hostname) {
+    const parts = String(hostname || '').toLowerCase().split('.').filter(Boolean);
+    if (parts.length <= 2) return parts.join('.');
+    return parts.slice(-2).join('.');
+}
+
+function shouldBlockRequestUrl(requestUrl, rootHostname) {
+    try {
+        const parsed = new URL(requestUrl);
+        if (!['http:', 'https:'].includes(parsed.protocol)) return false;
+
+        const host = parsed.hostname.toLowerCase();
+        const root = String(rootHostname || '').toLowerCase();
+        const baseRoot = getBaseDomain(root);
+        const baseHost = getBaseDomain(host);
+
+        const blockedHostPatterns = [
+            'doubleclick.net',
+            'googlesyndication.com',
+            'googleadservices.com',
+            'adservice.google.com',
+            'googletagmanager.com',
+            'google-analytics.com',
+            'facebook.net',
+            'facebook.com',
+            'tiktok.com',
+            'hotjar.com',
+            'segment.com'
+        ];
+
+        if (blockedHostPatterns.some(pattern => host === pattern || host.endsWith(`.${pattern}`))) {
+            return true;
+        }
+
+        const isFirstParty = host === root || host.endsWith(`.${root}`) || (baseRoot && baseHost === baseRoot);
+        return !isFirstParty;
+    } catch (error) {
+        return false;
+    }
+}
+
+async function applyRequestPolicy(page, rootHostname) {
+    await page.setRequestInterception(true);
+    page.on('request', (request) => {
+        const requestUrl = request.url();
+        if (shouldBlockRequestUrl(requestUrl, rootHostname)) {
+            return request.abort('blockedbyclient');
+        }
+        return request.continue();
+    });
+}
+
 function getAssetStoragePathForUrl(baseDir, url) {
     const hash = crypto.createHash('sha1').update(url).digest('hex');
     const parsed = new URL(url);
@@ -538,6 +591,7 @@ app.post('/capture', async (req, res) => {
             browser = await puppeteer.launch(launchOptions);
             const page = await browser.newPage();
             await page.setCacheEnabled(false);
+            await applyRequestPolicy(page, urlObj.hostname);
             await page.setBypassCSP(true);
             await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 60000 });
 
@@ -644,6 +698,7 @@ async function captureSite(targetUrl, requestId = null, forceRefresh = false) {
         publishUpdate( { type: 'status', requestId, message: 'New page created.' });
 
         await page.setCacheEnabled(false);
+        await applyRequestPolicy(page, urlObj.hostname);
         const networkDir = path.join(siteDir, 'network_assets');
         const networkCapture = setupNetworkCapture(page, networkDir);
         publishUpdate( { type: 'status', requestId, message: 'Network capture enabled (saving all requested assets).' });
