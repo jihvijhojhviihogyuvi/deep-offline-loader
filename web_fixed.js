@@ -588,6 +588,15 @@ app.get('/', (req, res) => {
                     updateButton.addEventListener('click', () => loadGame(undefined, true));
                 });
 
+                function normalizeUrl(url) {
+                    return url.startsWith('http') ? url : ('https://' + url);
+                }
+
+                function renderSavedSite(iframe, sitePath, originalUrl) {
+                    iframe.style.display = 'block';
+                    iframe.src = '/view-site?sitePath=' + encodeURIComponent(sitePath) + '&url=' + encodeURIComponent(normalizeUrl(originalUrl));
+                }
+
                 async function loadFromCacheOnly(url, status, iframe) {
                     const cacheResponse = await fetch('/check-cache', {
                         method: 'POST',
@@ -606,8 +615,7 @@ app.get('/', (req, res) => {
 
                     const cacheResult = await cacheResponse.json();
                     if (cacheResult.hit && cacheResult.sitePath) {
-                        iframe.style.display = 'block';
-                        iframe.src = '/view-site?sitePath=' + encodeURIComponent(cacheResult.sitePath) + '&url=' + encodeURIComponent(url.startsWith('http') ? url : 'https://' + url);
+                        renderSavedSite(iframe, cacheResult.sitePath, url);
                         currentSitePath = cacheResult.sitePath;
                         status.innerText = "📁 [LOCAL] " + (cacheResult.path || '/');
                         return true;
@@ -655,10 +663,9 @@ app.get('/', (req, res) => {
                             return;
                         }
 
-                        if (data.html) {
+                        if (data.sitePath) {
                             status.innerText = data.fromCache ? "📁 [LOCAL] " + data.path : "🌐 [SAVED] " + data.path;
-                            iframe.style.display = 'block';
-                            iframe.srcdoc = data.html;
+                            renderSavedSite(iframe, data.sitePath, url);
                             currentSitePath = data.sitePath;
 
                             window.onmessage = (e) => {
