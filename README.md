@@ -423,3 +423,5 @@ The main `LOAD & SAVE` flow now uses `POST /capture` (request/response) with imm
 Capture now blocks third-party ad/tracker domains and non-first-party requests by default, so saved assets focus on site-required resources instead of downloading random ad/analytics content.
 
 Frontend load behavior now uses direct `POST /capture` responses (no dependency on SSE/poll for rendering): cached pages are returned immediately, and offline mode attempts cache-only load and shows "choose another site" when not saved.
+
+Offline replay now uses `/replay-resource` so requests made while browsing saved pages are stored into `network_manifest.json`/`network_assets` as they happen (except blocked ad/tracker domains).

@@ -198,11 +198,20 @@ function injectOfflineReplayScript(html, siteDir) {
     try {
       const absolute = new URL(rawUrl, window.location.href);
       if (!/^https?:$/i.test(absolute.protocol)) return rawUrl;
-      return '/asset?sitePath=' + encodeURIComponent(sitePath) + '&url=' + encodeURIComponent(absolute.href) + '&method=' + encodeURIComponent((method || 'GET').toUpperCase());
+      return '/replay-resource?sitePath=' + encodeURIComponent(sitePath) + '&url=' + encodeURIComponent(absolute.href) + '&method=' + encodeURIComponent((method || 'GET').toUpperCase());
     } catch (_) {
       return rawUrl;
     }
   };
+
+  const rewriteNodeUrl = (node, attribute) => {
+    const value = node.getAttribute(attribute);
+    if (!value) return;
+    node.setAttribute(attribute, toReplayUrl(value, 'GET'));
+  };
+
+  document.querySelectorAll('[src]').forEach((node) => rewriteNodeUrl(node, 'src'));
+  document.querySelectorAll('[href]').forEach((node) => rewriteNodeUrl(node, 'href'));
 
   const originalFetch = window.fetch ? window.fetch.bind(window) : null;
   if (originalFetch) {
@@ -239,8 +248,9 @@ function injectOfflineReplayScript(html, siteDir) {
 
 function prepareHtmlForOfflineReplay(html, siteDir) {
     if (!ENABLE_LOCAL_REPLAY) return html;
-    const rewritten = rewriteHtmlToLocalAssets(html, siteDir);
-    return injectOfflineReplayScript(rewritten, siteDir);
+    const rewrittenKnown = rewriteHtmlToLocalAssets(html, siteDir);
+    const rewrittenProxy = rewriteHtmlToReplayProxy(rewrittenKnown, siteDir);
+    return injectOfflineReplayScript(rewrittenProxy, siteDir);
 }
 
 function isSafeSitePath(sitePath) {
@@ -256,6 +266,28 @@ function loadNetworkManifest(siteDir) {
     } catch (error) {
         return [];
     }
+}
+
+
+function upsertManifestEntry(siteDir, entry) {
+    const manifestFile = path.join(siteDir, 'network_manifest.json');
+    const existing = loadNetworkManifest(siteDir);
+    const merged = mergeNetworkManifests(existing, [entry]);
+    fs.writeFileSync(manifestFile, JSON.stringify(merged, null, 2));
+}
+
+function findSavedAsset(siteDir, requestedUrl, method = 'GET') {
+    const manifest = loadNetworkManifest(siteDir);
+    return findAssetEntry(manifest, requestedUrl, method);
+}
+
+function makeReplayProxyUrl(siteDir, rawUrl, method = 'GET') {
+    return `/replay-resource?sitePath=${encodeURIComponent(siteDir)}&url=${encodeURIComponent(rawUrl)}&method=${encodeURIComponent((method || 'GET').toUpperCase())}`;
+}
+
+function rewriteHtmlToReplayProxy(html, siteDir) {
+    if (!ENABLE_LOCAL_REPLAY) return html;
+    return html.replace(/https?:\/\/[^\s"'<>]+/gi, (match) => makeReplayProxyUrl(siteDir, match));
 }
 
 function escapeRegExp(text) {
@@ -480,8 +512,8 @@ app.get('/view-site', (req, res) => {
 
     const savedHtml = fs.readFileSync(siteFile, 'utf8');
     const originalUrl = typeof req.query.url === 'string' ? req.query.url : null;
-    const withBaseHref = injectBaseHref(savedHtml, originalUrl);
-    const preparedHtml = prepareHtmlForOfflineReplay(withBaseHref, sitePath);
+    const preparedReplayHtml = prepareHtmlForOfflineReplay(savedHtml, sitePath);
+    const preparedHtml = injectBaseHref(preparedReplayHtml, originalUrl);
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     return res.send(preparedHtml);
 });
@@ -528,6 +560,57 @@ app.get('/download-current-site', async (req, res) => {
             res.status(500).send({ error: err.message });
         }
     });
+});
+
+app.all('/replay-resource', async (req, res) => {
+    const sitePath = req.query.sitePath;
+    const requestedUrl = req.query.url;
+    const method = (req.query.method || req.method || 'GET').toUpperCase();
+
+    if (!isSafeSitePath(sitePath) || !requestedUrl) {
+        return res.status(400).send('Invalid replay request.');
+    }
+
+    if (shouldBlockRequestUrl(requestedUrl, new URL(requestedUrl).hostname)) {
+        return res.status(204).end();
+    }
+
+    const cached = findSavedAsset(sitePath, requestedUrl, method);
+    if (cached && cached.bodyPath && fs.existsSync(cached.bodyPath)) {
+        const resolved = path.resolve(cached.bodyPath);
+        if (!resolved.startsWith(sitePath)) return res.status(400).send('Invalid cached path.');
+        const contentType = cached.headers && (cached.headers['content-type'] || cached.headers['Content-Type']);
+        if (contentType) res.setHeader('Content-Type', contentType);
+        return res.sendFile(resolved);
+    }
+
+    try {
+        const response = await fetch(requestedUrl, { method: method === 'GET' ? 'GET' : method });
+        const buf = Buffer.from(await response.arrayBuffer());
+        const networkDir = path.join(sitePath, 'network_assets');
+        const bodyPath = getAssetStoragePathForUrl(networkDir, requestedUrl);
+        await fs.promises.mkdir(path.dirname(bodyPath), { recursive: true });
+        await fs.promises.writeFile(bodyPath, buf);
+
+        const headers = {};
+        response.headers.forEach((v, k) => { headers[k] = v; });
+        upsertManifestEntry(sitePath, {
+            url: requestedUrl,
+            method,
+            resourceType: 'replay',
+            status: response.status,
+            headers,
+            timestamp: new Date().toISOString(),
+            bodyPath,
+            bodySize: buf.length
+        });
+
+        const contentType = headers['content-type'];
+        if (contentType) res.setHeader('Content-Type', contentType);
+        return res.status(response.status).send(buf);
+    } catch (error) {
+        return res.status(502).send('Replay fetch failed');
+    }
 });
 
 app.get('/asset', (req, res) => {
