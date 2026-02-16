@@ -625,6 +625,48 @@ function findSavedAsset(siteDir, requestedUrl, method = 'GET') {
     return findAssetEntry(manifest, requestedUrl, method);
 }
 
+function isImageManifestEntry(entry) {
+    if (!entry) return false;
+    const resourceType = String(entry.resourceType || '').toLowerCase();
+    if (resourceType === 'image') return true;
+    const contentType = String((entry.headers && (entry.headers['content-type'] || entry.headers['Content-Type'])) || '').toLowerCase();
+    return contentType.startsWith('image/');
+}
+
+function mirrorCapturedImages(siteDir, manifestEntries) {
+    const imagesDir = path.join(siteDir, 'images');
+    let copied = 0;
+    const seen = new Set();
+
+    for (const entry of manifestEntries || []) {
+        if (!isImageManifestEntry(entry)) continue;
+        if (!entry.bodyPath || !fs.existsSync(entry.bodyPath)) continue;
+
+        let safeName = null;
+        try {
+            const parsed = new URL(entry.url);
+            const base = path.basename(parsed.pathname) || 'image';
+            const ext = path.extname(base) || extensionFromContentType((entry.headers && (entry.headers['content-type'] || entry.headers['Content-Type'])) || '') || '.img';
+            const stem = path.basename(base, path.extname(base)) || 'image';
+            const hash = crypto.createHash('sha1').update(entry.url).digest('hex').slice(0, 12);
+            safeName = `${stem}_${hash}${ext}`;
+        } catch (_) {
+            const hash = crypto.createHash('sha1').update(String(entry.url || entry.bodyPath)).digest('hex').slice(0, 12);
+            safeName = `image_${hash}.img`;
+        }
+
+        if (seen.has(safeName)) continue;
+        seen.add(safeName);
+
+        fs.mkdirSync(imagesDir, { recursive: true });
+        const target = path.join(imagesDir, safeName);
+        fs.cpSync(entry.bodyPath, target, { force: true });
+        copied += 1;
+    }
+
+    return { copied, dir: imagesDir };
+}
+
 function makeReplayProxyUrl(siteDir, rawUrl, method = 'GET') {
     return `/replay-resource?sitePath=${encodeURIComponent(siteDir)}&url=${encodeURIComponent(rawUrl)}&method=${encodeURIComponent((method || 'GET').toUpperCase())}`;
 }
@@ -948,7 +990,8 @@ app.all('/replay-resource', async (req, res) => {
         const response = await fetch(requestedUrl, { method: method === 'GET' ? 'GET' : method });
         const buf = Buffer.from(await response.arrayBuffer());
         const networkDir = path.join(sitePath, 'network_assets');
-        const bodyPath = getAssetStoragePathForUrl(networkDir, requestedUrl);
+        const responseContentType = response.headers.get('content-type') || '';
+        const bodyPath = getAssetStoragePathForUrl(networkDir, requestedUrl, responseContentType);
         await fs.promises.mkdir(path.dirname(bodyPath), { recursive: true });
         await fs.promises.writeFile(bodyPath, buf);
 
@@ -964,6 +1007,10 @@ app.all('/replay-resource', async (req, res) => {
             bodyPath,
             bodySize: buf.length
         });
+
+        if (String(headers['content-type'] || '').toLowerCase().startsWith('image/')) {
+            mirrorCapturedImages(sitePath, [{ url: requestedUrl, headers, resourceType: 'image', bodyPath }]);
+        }
 
         const contentType = headers['content-type'];
         if (contentType) res.setHeader('Content-Type', contentType);
@@ -1066,8 +1113,13 @@ app.post('/capture', async (req, res) => {
         targetUrl = normalizedUrl;
 
         if (fs.existsSync(siteFile) && !forceRefresh) {
-            const savedHtml = fs.readFileSync(siteFile, 'utf8');
-            return res.json({ html: savedHtml, fromCache: true, path: urlObj.pathname, sitePath: siteDir });
+            const existingManifest = loadNetworkManifest(siteDir);
+            const hasSnapshot = fs.existsSync(path.join(siteDir, 'snapshot.mhtml'));
+            if (existingManifest.length > 0 || hasSnapshot) {
+                const savedHtml = fs.readFileSync(siteFile, 'utf8');
+                return res.json({ html: savedHtml, fromCache: true, path: urlObj.pathname, sitePath: siteDir });
+            }
+            console.warn(`[CAPTURE] Cache exists but missing dependencies for ${targetUrl}; recapturing.`);
         }
 
         let browser;
@@ -1131,11 +1183,12 @@ app.post('/capture', async (req, res) => {
             }
             const mergedManifest = mergeNetworkManifests(existingManifest, capturedRequests);
             fs.writeFileSync(networkManifestFile, JSON.stringify(mergedManifest, null, 2));
+            const mirroredImages = mirrorCapturedImages(siteDir, mergedManifest);
 
             const savedBodies = capturedRequests.filter((entry) => entry.bodyPath).length;
             const failedRequests = capturedRequests.filter((entry) => entry.failed).length;
             const imageEntries = capturedRequests.filter((entry) => String(entry.resourceType || '').toLowerCase() === 'image' || String((entry.headers && (entry.headers['content-type'] || entry.headers['Content-Type'])) || '').toLowerCase().startsWith('image/')).length;
-            console.log(`[CAPTURE] Completed ${targetUrl} | captured=${capturedRequests.length} savedBodies=${savedBodies} images=${imageEntries} failed=${failedRequests} manifestTotal=${mergedManifest.length}`);
+            console.log(`[CAPTURE] Completed ${targetUrl} | captured=${capturedRequests.length} savedBodies=${savedBodies} images=${imageEntries} failed=${failedRequests} manifestTotal=${mergedManifest.length} mirroredImages=${mirroredImages.copied}`);
 
             await browser.close();
             browser = null;
@@ -1312,11 +1365,12 @@ async function captureSite(targetUrl, requestId = null, forceRefresh = false) {
 
         const mergedManifest = mergeNetworkManifests(existingManifest, capturedRequests);
         fs.writeFileSync(networkManifestFile, JSON.stringify(mergedManifest, null, 2));
+        const mirroredImages = mirrorCapturedImages(siteDir, mergedManifest);
 
         const savedBodies = capturedRequests.filter((entry) => entry.bodyPath).length;
         const failedRequests = capturedRequests.filter((entry) => entry.failed).length;
         const imageEntries = capturedRequests.filter((entry) => String(entry.resourceType || '').toLowerCase() === 'image' || String((entry.headers && (entry.headers['content-type'] || entry.headers['Content-Type'])) || '').toLowerCase().startsWith('image/')).length;
-        console.log(`[CAPTURE] Background completed ${targetUrl} | captured=${capturedRequests.length} savedBodies=${savedBodies} images=${imageEntries} failed=${failedRequests} manifestTotal=${mergedManifest.length}`);
+        console.log(`[CAPTURE] Background completed ${targetUrl} | captured=${capturedRequests.length} savedBodies=${savedBodies} images=${imageEntries} failed=${failedRequests} manifestTotal=${mergedManifest.length} mirroredImages=${mirroredImages.copied}`);
         console.log(`[LOG] Dependency refresh complete for ${siteFile}`);
         publishUpdate( { type: 'status', requestId, message: `Dependencies refreshed (${capturedRequests.length} new requests, ${mergedManifest.length} total tracked).` });
 
