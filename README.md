@@ -415,3 +415,5 @@ Normal `LOAD & SAVE` now checks `/check-cache` first and directly opens `/view-s
 Cached `/view-site` rendering now injects a `<base href="...">` (from the original page URL) so relative script/style/image paths resolve correctly instead of rendering a blank page.
 
 When loading from cache, SSE fallback notices no longer overwrite the local-loaded status, so cached pages remain marked as local even if EventSource drops.
+
+While viewing a cached page, background/polled capture events are ignored unless a new capture is explicitly started, preventing unwanted recapture UI churn.

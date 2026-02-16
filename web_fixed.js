@@ -313,6 +313,7 @@ app.get('/', (req, res) => {
                 let currentRenderedPageVersion = null;
 
                 function applyUpdate(data) {
+                    if (!isCapturePending) return;
                     if (activeRequestId && data.requestId && data.requestId !== activeRequestId) return;
                     const status = document.getElementById('status');
                     const iframe = document.getElementById('displayFrame');
@@ -320,6 +321,7 @@ app.get('/', (req, res) => {
                     status.innerText = '📡 ' + data.message;
                     if (data.type === 'complete') {
                         isCapturePending = false;
+                        activeRequestId = null;
                         iframe.style.display = 'block';
                         currentSitePath = data.sitePath || null; // Store for download
 
@@ -345,6 +347,7 @@ app.get('/', (req, res) => {
                         };
                     } else if (data.type === 'error') {
                         isCapturePending = false;
+                        activeRequestId = null;
                         status.innerText = "❌ Error: " + data.message;
                     }
                 }
@@ -452,6 +455,7 @@ app.get('/', (req, res) => {
                                     currentRenderedPageVersion = cacheResult.pageVersion || null;
                                     status.innerText = "📁 [LOCAL] " + (cacheResult.path || '/');
                                     isCapturePending = false;
+                                    activeRequestId = null;
                                     return;
                                 }
                             }
@@ -475,10 +479,12 @@ app.get('/', (req, res) => {
                             ensurePolling();
                         } else {
                             isCapturePending = false;
+                            activeRequestId = null;
                             status.innerText = "❌ Server failed to start capture (HTTP " + response.status + ").";
                         }
                     } catch (err) {
                         isCapturePending = false;
+                        activeRequestId = null;
                         status.innerText = "❌ Client error: " + err.message;
                     }
                 }
