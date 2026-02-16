@@ -319,6 +319,7 @@ app.get('/', (req, res) => {
 
                     status.innerText = '📡 ' + data.message;
                     if (data.type === 'complete') {
+                        isCapturePending = false;
                         iframe.style.display = 'block';
                         currentSitePath = data.sitePath || null; // Store for download
 
@@ -343,6 +344,7 @@ app.get('/', (req, res) => {
                             if(e.data.type === 'navigate') loadGame(e.data.url);
                         };
                     } else if (data.type === 'error') {
+                        isCapturePending = false;
                         status.innerText = "❌ Error: " + data.message;
                     }
                 }
@@ -397,8 +399,10 @@ app.get('/', (req, res) => {
                 };
                 eventSource.onerror = function(err) {
                     console.error('EventSource failed:', err);
-                    document.getElementById('status').innerText = 'ℹ️ Using polling updates (SSE unavailable on this connection).';
                     ensurePolling();
+                    if (isCapturePending && !currentSitePath) {
+                        document.getElementById('status').innerText = 'ℹ️ Using polling updates (SSE unavailable on this connection).';
+                    }
                 };
 
                 document.addEventListener('DOMContentLoaded', () => {
@@ -410,6 +414,7 @@ app.get('/', (req, res) => {
 
                 let currentSitePath = null;
                 let activeRequestId = null;
+                let isCapturePending = false;
 
                 async function loadGame(targetUrl, forceRefresh = false) {
                     const url = targetUrl || document.getElementById('urlInput').value;
@@ -422,6 +427,7 @@ app.get('/', (req, res) => {
                     status.innerText = forceRefresh ? "🔄 Requesting forced refresh..." : "⏳ Requesting capture...";
                     iframe.style.display = "none";
                     currentSitePath = null; // Reset on new load
+                    isCapturePending = true;
                     activeRequestId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
                     try {
@@ -445,6 +451,7 @@ app.get('/', (req, res) => {
                                     currentRenderedSitePath = cacheResult.sitePath;
                                     currentRenderedPageVersion = cacheResult.pageVersion || null;
                                     status.innerText = "📁 [LOCAL] " + (cacheResult.path || '/');
+                                    isCapturePending = false;
                                     return;
                                 }
                             }
@@ -467,9 +474,11 @@ app.get('/', (req, res) => {
                             // Further updates will come via SSE or polling fallback
                             ensurePolling();
                         } else {
+                            isCapturePending = false;
                             status.innerText = "❌ Server failed to start capture (HTTP " + response.status + ").";
                         }
                     } catch (err) {
+                        isCapturePending = false;
                         status.innerText = "❌ Client error: " + err.message;
                     }
                 }
