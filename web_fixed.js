@@ -31,6 +31,19 @@ if (!fs.existsSync(STORAGE_DIR)) fs.mkdirSync(STORAGE_DIR);
 
 
 
+function buildSitePaths(targetUrl) {
+    let normalizedUrl = targetUrl;
+    if (!normalizedUrl.startsWith('http')) normalizedUrl = 'https://' + normalizedUrl;
+    const urlObj = new URL(normalizedUrl);
+
+    const safeHostname = urlObj.hostname.replace(/[^a-z0-9]/gi, '_');
+    const safePath = urlObj.pathname.replace(/[^a-z0-9]/gi, '_');
+    const siteDir = path.join(STORAGE_DIR, safeHostname, safePath);
+    const siteFile = path.join(siteDir, 'index.html');
+
+    return { normalizedUrl, urlObj, siteDir, siteFile };
+}
+
 function getAssetStoragePathForUrl(baseDir, url) {
     const hash = crypto.createHash('sha1').update(url).digest('hex');
     const parsed = new URL(url);
@@ -401,6 +414,31 @@ app.get('/', (req, res) => {
                     activeRequestId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
                     try {
+                        if (!forceRefresh) {
+                            const cacheResponse = await fetch('/check-cache', {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'Accept': 'application/json',
+                                    'ngrok-skip-browser-warning': 'true'
+                                },
+                                body: JSON.stringify({ url })
+                            });
+
+                            if (cacheResponse.ok) {
+                                const cacheResult = await cacheResponse.json();
+                                if (cacheResult.hit && cacheResult.sitePath) {
+                                    iframe.style.display = 'block';
+                                    iframe.src = '/view-site?sitePath=' + encodeURIComponent(cacheResult.sitePath);
+                                    currentSitePath = cacheResult.sitePath;
+                                    currentRenderedSitePath = cacheResult.sitePath;
+                                    currentRenderedPageVersion = cacheResult.pageVersion || null;
+                                    status.innerText = "📁 [LOCAL] " + (cacheResult.path || '/');
+                                    return;
+                                }
+                            }
+                        }
+
                         await syncLatestEventCursor();
                         // Send a non-blocking request to start capture
                         const response = await fetch('/capture-start', {
@@ -556,6 +594,23 @@ app.get('/download-all-sites-DEPRECATED', async (req, res) => {
 });
 
 
+app.post('/check-cache', (req, res) => {
+    try {
+        const targetUrl = req.body.url;
+        if (!targetUrl) return res.status(400).json({ hit: false, message: 'Missing url.' });
+
+        const { urlObj, siteDir, siteFile } = buildSitePaths(targetUrl);
+        const hit = fs.existsSync(siteFile);
+
+        if (!hit) return res.json({ hit: false });
+
+        const pageVersion = String(fs.statSync(siteFile).mtimeMs);
+        return res.json({ hit: true, sitePath: siteDir, path: urlObj.pathname, pageVersion });
+    } catch (error) {
+        return res.status(400).json({ hit: false, message: error.message });
+    }
+});
+
 // New endpoint to start the capture process in the background
 app.post('/capture-start', (req, res) => {
     const targetUrl = req.body.url;
@@ -576,14 +631,8 @@ async function captureSite(targetUrl, requestId = null, forceRefresh = false) {
     console.log(`[CAPTURE] captureSite function started for URL: ${targetUrl}`);
     publishUpdate( { type: 'status', requestId, message: `Starting capture for ${targetUrl}...` });
 
-    if (!targetUrl.startsWith('http')) targetUrl = 'https://' + targetUrl;
-    
-    const urlObj = new URL(targetUrl);
-    
-    const safeHostname = urlObj.hostname.replace(/[^a-z0-9]/gi, '_');
-    const safePath = urlObj.pathname.replace(/[^a-z0-9]/gi, '_');
-    const siteDir = path.join(STORAGE_DIR, safeHostname, safePath);
-    const siteFile = path.join(siteDir, 'index.html');
+    const { normalizedUrl, urlObj, siteDir, siteFile } = buildSitePaths(targetUrl);
+    targetUrl = normalizedUrl;
     const snapshotFile = path.join(siteDir, 'snapshot.mhtml');
 
     const hasCachedHtml = fs.existsSync(siteFile);

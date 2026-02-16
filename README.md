@@ -409,3 +409,5 @@ The viewer now tracks a page version and will not reload the iframe for duplicat
 Using saved cache now skips browser recapture by default, so opening an already-downloaded site does not relaunch Chromium unless cache is missing.
 
 UI now includes an `UPDATE PAGE` button that forces a recapture even when a saved cache exists; regular `LOAD & SAVE` uses cached page immediately when available.
+
+Normal `LOAD & SAVE` now checks `/check-cache` first and directly opens `/view-site` for saved pages without starting a capture job, so cached pages stay stable and do not switch to background update flow unless you press `UPDATE PAGE`.
