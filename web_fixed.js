@@ -15,6 +15,8 @@ sseEvents.setMaxListeners(0);
 const eventHistory = [];
 let eventSeq = 0;
 const ENABLE_LOCAL_REPLAY = true;
+const CAPTURE_NAV_TIMEOUT_MS = Number(process.env.CAPTURE_NAV_TIMEOUT_MS || 120000);
+const CAPTURE_WARMUP_MS = Number(process.env.CAPTURE_WARMUP_MS || 15000);
 
 function publishUpdate(data) {
     eventSeq += 1;
@@ -717,7 +719,7 @@ app.get('/', (req, res) => {
 
                     if (!cacheResponse.ok) {
                         status.innerText = "❌ Cache check failed. Choose another site.";
-                        return true;
+                        return false;
                     }
 
                     const cacheResult = await cacheResponse.json();
@@ -728,8 +730,8 @@ app.get('/', (req, res) => {
                         return true;
                     }
 
-                    status.innerText = "ℹ️ Offline and this site is not saved. Choose another site.";
-                    return true;
+                    status.innerText = "ℹ️ No local save found. Starting capture...";
+                    return false;
                 }
 
                 async function loadGame(targetUrl, forceRefresh = false) {
@@ -745,15 +747,19 @@ app.get('/', (req, res) => {
                     currentSitePath = null;
 
                     try {
-                        if (!navigator.onLine) {
-                            if (forceRefresh) {
-                                status.innerText = "ℹ️ Offline mode: cannot update right now. Choose another site or reconnect.";
+                        if (!forceRefresh) {
+                            const loadedCached = await loadFromCacheOnly(url, status, iframe);
+                            if (loadedCached) {
                                 return;
                             }
-                            await loadFromCacheOnly(url, status, iframe);
+                        }
+
+                        if (!navigator.onLine) {
+                            status.innerText = "ℹ️ Offline mode: cannot update right now. Choose another site or reconnect.";
                             return;
                         }
 
+                        status.innerText = "⏳ Capturing fresh copy (this can take a bit on heavy games)...";
                         const response = await fetch('/capture', {
                             method: 'POST',
                             headers: {
@@ -1034,8 +1040,10 @@ app.post('/capture', async (req, res) => {
             const networkDir = path.join(siteDir, 'network_assets');
             const networkCapture = setupNetworkCapture(page, networkDir);
             await page.setBypassCSP(true);
-            await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 60000 });
-            await warmupPageForOfflineCapture(page, 15000);
+            console.log(`[CAPTURE] Navigating with timeout=${CAPTURE_NAV_TIMEOUT_MS}ms url=${targetUrl}`);
+            await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: CAPTURE_NAV_TIMEOUT_MS });
+            console.log(`[CAPTURE] Warmup for ${CAPTURE_WARMUP_MS}ms url=${targetUrl}`);
+            await warmupPageForOfflineCapture(page, CAPTURE_WARMUP_MS);
 
             const gameData = await page.evaluate(() => {
                 document.querySelectorAll('a').forEach(link => {
@@ -1187,9 +1195,11 @@ async function captureSite(targetUrl, requestId = null, forceRefresh = false) {
 
         publishUpdate( { type: 'status', requestId, message: `Navigating to ${targetUrl}...` });
         console.log(`[LOG] Navigating to ${targetUrl}...`);
-        await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 60000 });
-        publishUpdate( { type: 'status', requestId, message: 'Running deep warmup to trigger lazy game assets...' });
-        await warmupPageForOfflineCapture(page, 15000);
+        console.log(`[CAPTURE] Navigating with timeout=${CAPTURE_NAV_TIMEOUT_MS}ms url=${targetUrl}`);
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: CAPTURE_NAV_TIMEOUT_MS });
+        publishUpdate( { type: 'status', requestId, message: `Running deep warmup (${CAPTURE_WARMUP_MS}ms) to trigger lazy game assets...` });
+        console.log(`[CAPTURE] Warmup for ${CAPTURE_WARMUP_MS}ms url=${targetUrl}`);
+        await warmupPageForOfflineCapture(page, CAPTURE_WARMUP_MS);
         console.log('[LOG] Navigation complete.');
         publishUpdate( { type: 'status', requestId, message: 'Navigation complete.' });
 
