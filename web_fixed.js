@@ -633,8 +633,14 @@ function isImageManifestEntry(entry) {
     return contentType.startsWith('image/');
 }
 
-function mirrorCapturedImages(siteDir, manifestEntries) {
+function ensureImagesDir(siteDir) {
     const imagesDir = path.join(siteDir, 'images');
+    fs.mkdirSync(imagesDir, { recursive: true });
+    return imagesDir;
+}
+
+function mirrorCapturedImages(siteDir, manifestEntries) {
+    const imagesDir = ensureImagesDir(siteDir);
     let copied = 0;
     const seen = new Set();
 
@@ -658,7 +664,6 @@ function mirrorCapturedImages(siteDir, manifestEntries) {
         if (seen.has(safeName)) continue;
         seen.add(safeName);
 
-        fs.mkdirSync(imagesDir, { recursive: true });
         const target = path.join(imagesDir, safeName);
         fs.cpSync(entry.bodyPath, target, { force: true });
         copied += 1;
@@ -838,19 +843,21 @@ app.get('/', (req, res) => {
                     currentSitePath = null;
 
                     try {
-                        if (!forceRefresh) {
-                            const loadedCached = await loadFromCacheOnly(url, status, iframe);
-                            if (loadedCached) {
+                        if (!navigator.onLine) {
+                            if (forceRefresh) {
+                                status.innerText = "ℹ️ Offline mode: cannot update right now. Choose another site or reconnect.";
                                 return;
                             }
-                        }
-
-                        if (!navigator.onLine) {
-                            status.innerText = "ℹ️ Offline mode: cannot update right now. Choose another site or reconnect.";
+                            const loadedCached = await loadFromCacheOnly(url, status, iframe);
+                            if (!loadedCached) {
+                                status.innerText = "ℹ️ Offline and no saved copy exists yet. Connect to WiFi and load once to save it.";
+                            }
                             return;
                         }
 
-                        status.innerText = "⏳ Capturing fresh copy (this can take a bit on heavy games)...";
+                        status.innerText = forceRefresh
+                            ? "🔄 Updating from web and resaving..."
+                            : "⏳ Loading from web and saving local copy...";
                         const response = await fetch('/capture', {
                             method: 'POST',
                             headers: {
@@ -1111,11 +1118,14 @@ app.post('/capture', async (req, res) => {
     try {
         const { normalizedUrl, urlObj, siteDir, siteFile } = buildSitePaths(targetUrl);
         targetUrl = normalizedUrl;
+        ensureImagesDir(siteDir);
 
         if (fs.existsSync(siteFile) && !forceRefresh) {
+            ensureImagesDir(siteDir);
             const existingManifest = loadNetworkManifest(siteDir);
             const hasSnapshot = fs.existsSync(path.join(siteDir, 'snapshot.mhtml'));
             if (existingManifest.length > 0 || hasSnapshot) {
+                mirrorCapturedImages(siteDir, existingManifest);
                 const savedHtml = fs.readFileSync(siteFile, 'utf8');
                 return res.json({ html: savedHtml, fromCache: true, path: urlObj.pathname, sitePath: siteDir });
             }
@@ -1231,6 +1241,7 @@ async function captureSite(targetUrl, requestId = null, forceRefresh = false) {
 
     const { normalizedUrl, urlObj, siteDir, siteFile } = buildSitePaths(targetUrl);
     targetUrl = normalizedUrl;
+    ensureImagesDir(siteDir);
     const snapshotFile = path.join(siteDir, 'snapshot.mhtml');
 
     const hasCachedHtml = fs.existsSync(siteFile);
