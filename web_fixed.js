@@ -17,6 +17,7 @@ let eventSeq = 0;
 const ENABLE_LOCAL_REPLAY = true;
 const CAPTURE_NAV_TIMEOUT_MS = Number(process.env.CAPTURE_NAV_TIMEOUT_MS || 120000);
 const CAPTURE_WARMUP_MS = Number(process.env.CAPTURE_WARMUP_MS || 15000);
+const BLOCK_TRACKERS = String(process.env.BLOCK_TRACKERS || 'false').toLowerCase() === 'true';
 
 function publishUpdate(data) {
     eventSeq += 1;
@@ -72,6 +73,8 @@ function shouldBlockRequestUrl(requestUrl, rootHostname) {
         const root = String(rootHostname || '').toLowerCase();
         const baseRoot = getBaseDomain(root);
         const baseHost = getBaseDomain(host);
+
+        if (!BLOCK_TRACKERS) return false;
 
         const blockedHostPatterns = [
             'doubleclick.net',
@@ -234,6 +237,54 @@ async function warmupPageForOfflineCapture(page, extraWaitMs = 15000, getCapture
             }
             if (idleStreak >= 2) break;
         }
+    }
+}
+
+
+async function prefetchCriticalResources(page) {
+    try {
+        const summary = await page.evaluate(async () => {
+            const urls = new Set();
+
+            document.querySelectorAll('img[src], iframe[src], source[src], link[rel="preload"][href], link[rel="stylesheet"][href]').forEach((node) => {
+                const candidate = node.getAttribute('src') || node.getAttribute('href');
+                if (!candidate) return;
+                try {
+                    const absolute = new URL(candidate, window.location.href).href;
+                    if (/^https?:/i.test(absolute)) urls.add(absolute);
+                } catch (_) {}
+            });
+
+            document.querySelectorAll('[style]').forEach((node) => {
+                const style = node.getAttribute('style') || '';
+                const matches = style.match(/url\(([^)]+)\)/gi) || [];
+                matches.forEach((m) => {
+                    const raw = m.replace(/^url\(/i, '').replace(/\)$/,'').trim().replace(/^['"]|['"]$/g, '');
+                    if (!raw) return;
+                    try {
+                        const absolute = new URL(raw, window.location.href).href;
+                        if (/^https?:/i.test(absolute)) urls.add(absolute);
+                    } catch (_) {}
+                });
+            });
+
+            let ok = 0;
+            let fail = 0;
+            for (const url of Array.from(urls)) {
+                try {
+                    const response = await fetch(url, { method: 'GET', credentials: 'include', mode: 'cors' });
+                    if (response.ok || response.status === 0) ok += 1;
+                    else fail += 1;
+                } catch (_) {
+                    fail += 1;
+                }
+            }
+
+            return { total: urls.size, ok, fail };
+        });
+        console.log(`[CAPTURE] Prefetch critical resources total=${summary.total} ok=${summary.ok} fail=${summary.fail}`);
+    } catch (error) {
+        console.warn('[CAPTURE] Prefetch skipped:', error.message);
     }
 }
 
@@ -857,7 +908,7 @@ app.get('/', (req, res) => {
 
                         status.innerText = forceRefresh
                             ? "🔄 Updating from web and resaving..."
-                            : "⏳ Loading from web and saving local copy...";
+                            : "⏳ Loading from WiFi/web first, then saving local copy...";
                         const response = await fetch('/capture', {
                             method: 'POST',
                             headers: {
@@ -1155,6 +1206,7 @@ app.post('/capture', async (req, res) => {
             await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: CAPTURE_NAV_TIMEOUT_MS });
             console.log(`[CAPTURE] Warmup for ${CAPTURE_WARMUP_MS}ms url=${targetUrl}`);
             await warmupPageForOfflineCapture(page, CAPTURE_WARMUP_MS, () => networkCapture.getCapturedCount());
+            await prefetchCriticalResources(page);
 
             const gameData = await page.evaluate(() => {
                 document.querySelectorAll('a').forEach(link => {
@@ -1313,6 +1365,7 @@ async function captureSite(targetUrl, requestId = null, forceRefresh = false) {
         publishUpdate( { type: 'status', requestId, message: `Running deep warmup (${CAPTURE_WARMUP_MS}ms) to trigger lazy game assets...` });
         console.log(`[CAPTURE] Warmup for ${CAPTURE_WARMUP_MS}ms url=${targetUrl}`);
         await warmupPageForOfflineCapture(page, CAPTURE_WARMUP_MS, () => networkCapture.getCapturedCount());
+        await prefetchCriticalResources(page);
         console.log('[LOG] Navigation complete.');
         publishUpdate( { type: 'status', requestId, message: 'Navigation complete.' });
 
