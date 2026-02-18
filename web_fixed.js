@@ -4,23 +4,774 @@ const fs = require('fs');
 const path = require('path');
 const archiver = require('archiver');
 const EventEmitter = require('events');
+const crypto = require('crypto');
+const os = require('os');
 
 const app = express();
 const port = 8000;
 
 const sseEvents = new EventEmitter();
-sseEvents.setMaxListeners(0); 
+sseEvents.setMaxListeners(0);
+const eventHistory = [];
+let eventSeq = 0;
+const ENABLE_LOCAL_REPLAY = true;
+const CAPTURE_NAV_TIMEOUT_MS = Number(process.env.CAPTURE_NAV_TIMEOUT_MS || 120000);
+const CAPTURE_WARMUP_MS = Number(process.env.CAPTURE_WARMUP_MS || 15000);
+const BLOCK_TRACKERS = String(process.env.BLOCK_TRACKERS || 'false').toLowerCase() === 'true';
+
+function publishUpdate(data) {
+    eventSeq += 1;
+    const entry = { id: eventSeq, data };
+    eventHistory.push(entry);
+    if (eventHistory.length > 500) eventHistory.shift();
+    sseEvents.emit('update', data);
+}
 
 app.use(express.json());
 
 const STORAGE_DIR = path.join(__dirname, 'saved_sites');
 if (!fs.existsSync(STORAGE_DIR)) fs.mkdirSync(STORAGE_DIR);
 
+
+
+
+function injectBaseHref(html, originalUrl) {
+    if (!originalUrl) return html;
+    const baseTag = `<base href="${originalUrl}">`;
+    if (/<base\s+href=/i.test(html)) return html;
+    if (html.includes('</head>')) return html.replace('</head>', `${baseTag}</head>`);
+    if (/<html[^>]*>/i.test(html)) return html.replace(/<html[^>]*>/i, (tag) => `${tag}<head>${baseTag}</head>`);
+    return `${baseTag}${html}`;
+}
+
+function buildSitePaths(targetUrl) {
+    let normalizedUrl = targetUrl;
+    if (!normalizedUrl.startsWith('http')) normalizedUrl = 'https://' + normalizedUrl;
+    const urlObj = new URL(normalizedUrl);
+
+    const safeHostname = urlObj.hostname.replace(/[^a-z0-9]/gi, '_');
+    const safePath = urlObj.pathname.replace(/[^a-z0-9]/gi, '_');
+    const siteDir = path.join(STORAGE_DIR, safeHostname, safePath);
+    const siteFile = path.join(siteDir, 'index.html');
+
+    return { normalizedUrl, urlObj, siteDir, siteFile };
+}
+
+
+function getBaseDomain(hostname) {
+    const parts = String(hostname || '').toLowerCase().split('.').filter(Boolean);
+    if (parts.length <= 2) return parts.join('.');
+    return parts.slice(-2).join('.');
+}
+
+function shouldBlockRequestUrl(requestUrl, rootHostname) {
+    try {
+        const parsed = new URL(requestUrl);
+        if (!['http:', 'https:'].includes(parsed.protocol)) return false;
+
+        const host = parsed.hostname.toLowerCase();
+        const root = String(rootHostname || '').toLowerCase();
+        const baseRoot = getBaseDomain(root);
+        const baseHost = getBaseDomain(host);
+
+        if (!BLOCK_TRACKERS) return false;
+
+        const blockedHostPatterns = [
+            'doubleclick.net',
+            'googlesyndication.com',
+            'googleadservices.com',
+            'adservice.google.com',
+            'googletagmanager.com',
+            'google-analytics.com',
+            'facebook.net',
+            'facebook.com',
+            'tiktok.com',
+            'hotjar.com',
+            'segment.com'
+        ];
+
+        if (blockedHostPatterns.some(pattern => host === pattern || host.endsWith(`.${pattern}`))) {
+            return true;
+        }
+
+        const isFirstParty = host === root || host.endsWith(`.${root}`) || (baseRoot && baseHost === baseRoot);
+        if (isFirstParty) return false;
+
+        // Allow non-ad/tracker third-party resources (CDNs/payment/game backends) for compatibility.
+        return false;
+    } catch (error) {
+        return false;
+    }
+}
+
+async function applyRequestPolicy(page, rootHostname) {
+    await page.setRequestInterception(true);
+    page.on('request', (request) => {
+        const requestUrl = request.url();
+        if (shouldBlockRequestUrl(requestUrl, rootHostname)) {
+            return request.abort('blockedbyclient');
+        }
+        return request.continue();
+    });
+}
+
+
+function persistChromiumCache(userDataDir, siteDir) {
+    if (!userDataDir || !fs.existsSync(userDataDir)) return;
+    const targets = [
+        ['Default/Cache', 'browser_cache/Default/Cache'],
+        ['Default/Code Cache', 'browser_cache/Default/Code Cache'],
+        ['Default/Service Worker', 'browser_cache/Default/Service Worker'],
+        ['Default/IndexedDB', 'browser_cache/Default/IndexedDB'],
+        ['Default/Local Storage', 'browser_cache/Default/Local Storage']
+    ];
+
+    targets.forEach(([sourceRel, destRel]) => {
+        const source = path.join(userDataDir, sourceRel);
+        const dest = path.join(siteDir, destRel);
+        if (!fs.existsSync(source)) return;
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.cpSync(source, dest, { recursive: true, force: true });
+    });
+}
+
+function extensionFromContentType(contentType) {
+    const normalized = String(contentType || '').toLowerCase().split(';')[0].trim();
+    const map = {
+        'image/png': '.png',
+        'image/jpeg': '.jpg',
+        'image/jpg': '.jpg',
+        'image/webp': '.webp',
+        'image/gif': '.gif',
+        'image/svg+xml': '.svg',
+        'image/x-icon': '.ico',
+        'image/avif': '.avif',
+        'text/css': '.css',
+        'application/javascript': '.js',
+        'text/javascript': '.js',
+        'application/json': '.json',
+        'text/html': '.html',
+        'font/woff': '.woff',
+        'font/woff2': '.woff2',
+        'application/wasm': '.wasm',
+        'audio/mpeg': '.mp3',
+        'audio/ogg': '.ogg',
+        'video/mp4': '.mp4'
+    };
+    return map[normalized] || null;
+}
+
+function getAssetStoragePathForUrl(baseDir, url, contentType = null) {
+    const hash = crypto.createHash('sha1').update(url).digest('hex');
+    const parsed = new URL(url);
+    const safeHost = parsed.hostname.replace(/[^a-z0-9.-]/gi, '_');
+    const safePath = parsed.pathname.replace(/[^a-z0-9./_-]/gi, '_') || '/';
+    const normalizedPath = safePath.endsWith('/') ? `${safePath}index` : safePath;
+    const relativePath = normalizedPath.startsWith('/') ? normalizedPath.slice(1) : normalizedPath;
+    const pathExt = path.extname(relativePath);
+    const inferredExt = extensionFromContentType(contentType);
+    const extension = pathExt || inferredExt || '.bin';
+    const fileName = `${path.basename(relativePath, path.extname(relativePath)) || 'asset'}_${hash.slice(0, 12)}${extension}`;
+    return path.join(baseDir, safeHost, fileName);
+}
+
+
+async function warmupPageForOfflineCapture(page, extraWaitMs = 15000, getCapturedCount = null) {
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    try {
+        await wait(600);
+        await page.evaluate(async () => {
+            const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            const maxY = Math.max(document.body ? document.body.scrollHeight : 0, document.documentElement ? document.documentElement.scrollHeight : 0, window.innerHeight || 0);
+            const points = [0, Math.floor(maxY * 0.35), Math.floor(maxY * 0.7), maxY, 0];
+            for (const point of points) {
+                window.scrollTo(0, point);
+                await delay(250);
+            }
+        });
+    } catch (error) {
+        // Non-fatal: some pages disallow evaluate in transient states.
+    }
+
+    const frames = page.frames();
+    for (const frame of frames) {
+        try {
+            if (frame === page.mainFrame()) continue;
+            await frame.evaluate(() => {
+                if (document && document.readyState === 'loading') return;
+                window.dispatchEvent(new Event('focus'));
+            });
+        } catch (error) {
+            // Cross-origin or sandboxed frame; ignore.
+        }
+    }
+
+    const maxWait = Math.max(0, extraWaitMs);
+    const minWaitBeforeFastExit = Math.min(maxWait, 5000);
+    const end = Date.now() + maxWait;
+    let idleStreak = 0;
+    let lastCount = typeof getCapturedCount === 'function' ? getCapturedCount() : 0;
+
+    while (Date.now() < end) {
+        const slice = Math.min(2200, end - Date.now());
+        if (slice <= 0) break;
+        try {
+            if (typeof page.waitForNetworkIdle === 'function') {
+                await page.waitForNetworkIdle({ idleTime: 650, timeout: slice });
+            } else {
+                await wait(slice);
+            }
+        } catch (error) {
+            await wait(slice);
+        }
+
+        const elapsed = maxWait - (end - Date.now());
+        if (typeof getCapturedCount === 'function' && elapsed >= minWaitBeforeFastExit) {
+            const currentCount = getCapturedCount();
+            if (currentCount === lastCount) {
+                idleStreak += 1;
+            } else {
+                idleStreak = 0;
+                lastCount = currentCount;
+            }
+            if (idleStreak >= 2) break;
+        }
+    }
+}
+
+
+async function prefetchCriticalResources(page) {
+    try {
+        const summary = await page.evaluate(async () => {
+            const urls = new Set();
+
+            document.querySelectorAll('img[src], iframe[src], source[src], link[rel="preload"][href], link[rel="stylesheet"][href]').forEach((node) => {
+                const candidate = node.getAttribute('src') || node.getAttribute('href');
+                if (!candidate) return;
+                try {
+                    const absolute = new URL(candidate, window.location.href).href;
+                    if (/^https?:/i.test(absolute)) urls.add(absolute);
+                } catch (_) {}
+            });
+
+            document.querySelectorAll('[style]').forEach((node) => {
+                const style = node.getAttribute('style') || '';
+                const matches = style.match(/url\(([^)]+)\)/gi) || [];
+                matches.forEach((m) => {
+                    const raw = m.replace(/^url\(/i, '').replace(/\)$/,'').trim().replace(/^['"]|['"]$/g, '');
+                    if (!raw) return;
+                    try {
+                        const absolute = new URL(raw, window.location.href).href;
+                        if (/^https?:/i.test(absolute)) urls.add(absolute);
+                    } catch (_) {}
+                });
+            });
+
+            let ok = 0;
+            let fail = 0;
+            for (const url of Array.from(urls)) {
+                try {
+                    const response = await fetch(url, { method: 'GET', credentials: 'include', mode: 'cors' });
+                    if (response.ok || response.status === 0) ok += 1;
+                    else fail += 1;
+                } catch (_) {
+                    fail += 1;
+                }
+            }
+
+            return { total: urls.size, ok, fail };
+        });
+        console.log(`[CAPTURE] Prefetch critical resources total=${summary.total} ok=${summary.ok} fail=${summary.fail}`);
+    } catch (error) {
+        console.warn('[CAPTURE] Prefetch skipped:', error.message);
+    }
+}
+
+function setupNetworkCapture(page, networkDir) {
+    const requests = [];
+    const pendingWrites = [];
+
+    page.on('response', (response) => {
+        const writeTask = (async () => {
+            const req = response.request();
+            const requestUrl = response.url();
+            if (!requestUrl.startsWith('http://') && !requestUrl.startsWith('https://')) return;
+
+            const headers = response.headers();
+            const responseContentType = headers['content-type'] || headers['Content-Type'] || '';
+            const targetPath = getAssetStoragePathForUrl(networkDir, requestUrl, responseContentType);
+            await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
+
+            let bodyPath = null;
+            let bodySize = 0;
+            try {
+                const body = await response.buffer();
+                bodySize = body.length;
+                bodyPath = `${targetPath}`;
+                await fs.promises.writeFile(bodyPath, body);
+            } catch (error) {
+                bodyPath = null;
+            }
+
+            const entry = {
+                url: requestUrl,
+                method: req.method(),
+                resourceType: req.resourceType(),
+                status: response.status(),
+                headers,
+                timestamp: new Date().toISOString(),
+                bodyPath,
+                bodySize
+            };
+            requests.push(entry);
+
+            if (bodyPath) {
+                try {
+                    const parsed = new URL(requestUrl);
+                    const isStaticLike = ['image', 'stylesheet', 'script', 'font', 'media'].includes(req.resourceType()) || /^image\//i.test(headers['content-type'] || '') || /^font\//i.test(headers['content-type'] || '');
+                    if (isStaticLike && parsed.search) {
+                        requests.push({
+                            ...entry,
+                            url: `${parsed.origin}${parsed.pathname}`,
+                            aliasOf: requestUrl
+                        });
+                    }
+                } catch (_) {
+                    // Ignore alias generation errors.
+                }
+            }
+        })();
+
+        pendingWrites.push(writeTask);
+    });
+
+    page.on('requestfailed', (request) => {
+        const failure = request.failure();
+        const requestUrl = request.url();
+        if (!requestUrl.startsWith('http://') && !requestUrl.startsWith('https://')) return;
+        requests.push({
+            url: requestUrl,
+            method: request.method(),
+            resourceType: request.resourceType(),
+            status: 0,
+            headers: {},
+            timestamp: new Date().toISOString(),
+            bodyPath: null,
+            bodySize: 0,
+            failed: true,
+            failureText: failure ? failure.errorText : 'unknown'
+        });
+    });
+
+    return {
+        getCapturedCount() {
+            return requests.length;
+        },
+        async finalize() {
+            await Promise.allSettled(pendingWrites);
+            return requests;
+        }
+    };
+}
+
+function normalizeCapturedUrl(rawUrl) {
+    try {
+        const parsed = new URL(rawUrl);
+        parsed.hash = '';
+        return parsed.toString();
+    } catch (error) {
+        return String(rawUrl || '');
+    }
+}
+
+function urlWithoutSearch(rawUrl) {
+    try {
+        const parsed = new URL(rawUrl);
+        return `${parsed.origin}${parsed.pathname}`;
+    } catch (error) {
+        return String(rawUrl || '');
+    }
+}
+
+function mergeNetworkManifests(existingEntries, newEntries) {
+    const mergedByKey = new Map();
+    [...existingEntries, ...newEntries].forEach((entry) => {
+        const key = `${entry.method || 'GET'}|${entry.url}|${entry.status}|${entry.resourceType}|${entry.bodySize || 0}`;
+        mergedByKey.set(key, entry);
+    });
+    return Array.from(mergedByKey.values());
+}
+
+
+
+function findAssetEntry(manifest, requestedUrl, method = 'GET') {
+    const normalizedMethod = (method || 'GET').toUpperCase();
+    const requestedNormalized = normalizeCapturedUrl(requestedUrl);
+    const requestedNoSearch = urlWithoutSearch(requestedNormalized);
+
+    const candidates = [
+        requestedUrl,
+        requestedNormalized,
+        requestedNoSearch
+    ];
+
+    const exists = (entry) => entry && entry.bodyPath && fs.existsSync(entry.bodyPath);
+    for (const candidate of candidates) {
+        const exactMethod = manifest.find((entry) => entry.url === candidate && (entry.method || 'GET').toUpperCase() === normalizedMethod && exists(entry));
+        if (exactMethod) return exactMethod;
+    }
+
+    for (const candidate of candidates) {
+        const anyMethod = manifest.find((entry) => entry.url === candidate && exists(entry));
+        if (anyMethod) return anyMethod;
+    }
+
+    try {
+        const req = new URL(requestedNormalized);
+        const pathnameMatch = manifest.find((entry) => {
+            if (!exists(entry)) return false;
+            try {
+                const candidate = new URL(entry.url);
+                if (`${candidate.origin}${candidate.pathname}` !== `${req.origin}${req.pathname}`) return false;
+                const resourceType = String(entry.resourceType || '').toLowerCase();
+                const contentType = String((entry.headers && (entry.headers['content-type'] || entry.headers['Content-Type'])) || '').toLowerCase();
+                return ['image', 'stylesheet', 'script', 'font', 'media'].includes(resourceType) || contentType.startsWith('image/') || contentType.startsWith('font/');
+            } catch (_) {
+                return false;
+            }
+        });
+        if (pathnameMatch) return pathnameMatch;
+    } catch (_) {
+        // ignore
+    }
+
+    return null;
+}
+
+function injectOfflineReplayScript(html, siteDir) {
+    if (!ENABLE_LOCAL_REPLAY) return html;
+    const replayScript = `
+<script>
+(() => {
+  const sitePath = ${JSON.stringify(siteDir)};
+  const toReplayUrl = (rawUrl, method = 'GET') => {
+    try {
+      if (!rawUrl) return rawUrl;
+      const text = String(rawUrl);
+      if (text.startsWith('/replay-resource?') || text.startsWith('/asset?')) return rawUrl;
+      const absolute = new URL(text, window.location.href);
+      if (/\/replay-resource\?/i.test(absolute.pathname + absolute.search) || /\/asset\?/i.test(absolute.pathname + absolute.search)) return rawUrl;
+      if (!/^https?:$/i.test(absolute.protocol)) return rawUrl;
+      return '/replay-resource?sitePath=' + encodeURIComponent(sitePath) + '&url=' + encodeURIComponent(absolute.href) + '&method=' + encodeURIComponent((method || 'GET').toUpperCase());
+    } catch (_) {
+      return rawUrl;
+    }
+  };
+
+  const shouldRewrite = (value) => {
+    if (!value) return false;
+    const trimmed = String(value).trim();
+    if (!trimmed) return false;
+    if (trimmed.startsWith('#')) return false;
+    if (/^(data:|blob:|javascript:|mailto:|tel:)/i.test(trimmed)) return false;
+    return true;
+  };
+
+  const rewriteNodeUrl = (node, attribute) => {
+    const value = node.getAttribute(attribute);
+    if (!shouldRewrite(value)) return;
+    node.setAttribute(attribute, toReplayUrl(value, 'GET'));
+  };
+
+  const rewriteSrcSet = (node) => {
+    const srcset = node.getAttribute('srcset');
+    if (!srcset) return;
+    const rewritten = srcset
+      .split(',')
+      .map((part) => {
+        const trimmed = part.trim();
+        if (!trimmed) return trimmed;
+        const [url, descriptor] = trimmed.split(/\s+/, 2);
+        if (!shouldRewrite(url)) return trimmed;
+        return descriptor ? toReplayUrl(url, 'GET') + ' ' + descriptor : toReplayUrl(url, 'GET');
+      })
+      .join(', ');
+    node.setAttribute('srcset', rewritten);
+  };
+
+  const rewriteTree = (root) => {
+    if (!root || !root.querySelectorAll) return;
+    if (root.matches) {
+      if (root.hasAttribute && root.hasAttribute('src')) rewriteNodeUrl(root, 'src');
+      if (root.hasAttribute && root.hasAttribute('href')) rewriteNodeUrl(root, 'href');
+      if (root.hasAttribute && root.hasAttribute('action')) rewriteNodeUrl(root, 'action');
+      if (root.hasAttribute && root.hasAttribute('poster')) rewriteNodeUrl(root, 'poster');
+      if (root.hasAttribute && root.hasAttribute('srcset')) rewriteSrcSet(root);
+    }
+    root.querySelectorAll('[src]').forEach((node) => rewriteNodeUrl(node, 'src'));
+    root.querySelectorAll('[href]').forEach((node) => rewriteNodeUrl(node, 'href'));
+    root.querySelectorAll('[action]').forEach((node) => rewriteNodeUrl(node, 'action'));
+    root.querySelectorAll('[poster]').forEach((node) => rewriteNodeUrl(node, 'poster'));
+    root.querySelectorAll('[srcset]').forEach((node) => rewriteSrcSet(node));
+  };
+
+  rewriteTree(document.documentElement || document);
+
+  if (typeof MutationObserver === 'function') {
+    const observer = new MutationObserver((mutations) => {
+      mutations.forEach((mutation) => {
+        if (mutation.type === 'attributes' && mutation.target) {
+          const attr = mutation.attributeName;
+          if (attr === 'src' || attr === 'href' || attr === 'action' || attr === 'poster') {
+            rewriteNodeUrl(mutation.target, attr);
+          }
+          if (attr === 'srcset') rewriteSrcSet(mutation.target);
+        }
+        mutation.addedNodes.forEach((node) => {
+          if (node && node.nodeType === 1) rewriteTree(node);
+        });
+      });
+    });
+    observer.observe(document.documentElement || document, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['src', 'href', 'action', 'poster', 'srcset']
+    });
+  }
+
+  document.addEventListener('DOMContentLoaded', () => rewriteTree(document.documentElement || document));
+
+  const originalFetch = window.fetch ? window.fetch.bind(window) : null;
+  if (originalFetch) {
+    window.fetch = (input, init = {}) => {
+      const method = (init && init.method) || (input && input.method) || 'GET';
+      if (typeof input === 'string') {
+        return originalFetch(toReplayUrl(input, method), init);
+      }
+      if (input && typeof input.url === 'string') {
+        return originalFetch(toReplayUrl(input.url, method), init);
+      }
+      return originalFetch(input, init);
+    };
+  }
+
+  const originalOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+    const rewritten = typeof url === 'string' ? toReplayUrl(url, method) : url;
+    return originalOpen.call(this, method, rewritten, ...rest);
+  };
+
+  if (navigator && typeof navigator.sendBeacon === 'function') {
+    const originalSendBeacon = navigator.sendBeacon.bind(navigator);
+    navigator.sendBeacon = (url, data) => originalSendBeacon(toReplayUrl(url, 'POST'), data);
+  }
+})();
+</script>
+`;
+
+    if (html.includes('</head>')) return html.replace('</head>', `${replayScript}</head>`);
+    if (html.includes('<body')) return html.replace(/<body[^>]*>/i, (tag) => `${tag}${replayScript}`);
+    return `${replayScript}${html}`;
+}
+
+function rewriteHtmlAttributesToReplayProxy(html, siteDir, originalUrl) {
+    if (!ENABLE_LOCAL_REPLAY || !originalUrl) return html;
+
+    const shouldRewrite = (value) => {
+        if (!value) return false;
+        const trimmed = String(value).trim();
+        if (!trimmed || trimmed.startsWith('#')) return false;
+        if (/^(data:|blob:|javascript:|mailto:|tel:)/i.test(trimmed)) return false;
+        return true;
+    };
+
+    const toAbsolute = (value) => {
+        try {
+            return new URL(value, originalUrl).href;
+        } catch (error) {
+            return null;
+        }
+    };
+
+    let localAssetRewriteCount = 0;
+    let replayProxyRewriteCount = 0;
+
+    const rewriteValue = (value, method = 'GET') => {
+        if (!shouldRewrite(value)) return value;
+        if (/^(\/replay-resource\?|\/asset\?)/i.test(value)) return value;
+        const absolute = toAbsolute(value);
+        if (!absolute || !/^https?:/i.test(absolute)) return value;
+
+        const localAsset = findSavedAsset(siteDir, absolute, method);
+        if (localAsset && localAsset.bodyPath && fs.existsSync(localAsset.bodyPath)) {
+            localAssetRewriteCount += 1;
+            return makeLocalAssetUrl(siteDir, absolute, method);
+        }
+
+        replayProxyRewriteCount += 1;
+        return makeReplayProxyUrl(siteDir, absolute, method);
+    };
+
+    let rewritten = html;
+    rewritten = rewritten.replace(/\b(src|href|poster)=(['"])(.*?)\2/gi, (match, attr, quote, value) => {
+        return `${attr}=${quote}${rewriteValue(value, 'GET')}${quote}`;
+    });
+
+    rewritten = rewritten.replace(/\baction=(['"])(.*?)\1/gi, (match, quote, value) => {
+        return `action=${quote}${rewriteValue(value, 'POST')}${quote}`;
+    });
+
+    rewritten = rewritten.replace(/\bsrcset=(['"])(.*?)\1/gi, (match, quote, value) => {
+        const updated = value
+            .split(',')
+            .map((part) => {
+                const trimmed = part.trim();
+                if (!trimmed) return trimmed;
+                const [rawUrl, descriptor] = trimmed.split(/\s+/, 2);
+                const transformed = rewriteValue(rawUrl, 'GET');
+                return descriptor ? `${transformed} ${descriptor}` : transformed;
+            })
+            .join(', ');
+        return `srcset=${quote}${updated}${quote}`;
+    });
+
+    console.log(`[VIEW] Rewrote URLs for ${siteDir} localAsset=${localAssetRewriteCount} replayProxy=${replayProxyRewriteCount}`);
+    return rewritten;
+}
+
+function prepareHtmlForOfflineReplay(html, siteDir, originalUrl = null) {
+    if (!ENABLE_LOCAL_REPLAY) return html;
+    const rewrittenKnown = rewriteHtmlToLocalAssets(html, siteDir);
+    const rewrittenWithRelativeUrls = rewriteHtmlAttributesToReplayProxy(rewrittenKnown, siteDir, originalUrl);
+    return injectOfflineReplayScript(rewrittenWithRelativeUrls, siteDir);
+}
+
+function isSafeSitePath(sitePath) {
+    return Boolean(sitePath) && sitePath.startsWith(STORAGE_DIR) && !sitePath.includes('..');
+}
+
+function loadNetworkManifest(siteDir) {
+    const networkManifestFile = path.join(siteDir, 'network_manifest.json');
+    if (!fs.existsSync(networkManifestFile)) return [];
+    try {
+        const parsed = JSON.parse(fs.readFileSync(networkManifestFile, 'utf8'));
+        return Array.isArray(parsed) ? parsed : [];
+    } catch (error) {
+        return [];
+    }
+}
+
+
+function upsertManifestEntry(siteDir, entry) {
+    const manifestFile = path.join(siteDir, 'network_manifest.json');
+    const existing = loadNetworkManifest(siteDir);
+    const merged = mergeNetworkManifests(existing, [entry]);
+    fs.writeFileSync(manifestFile, JSON.stringify(merged, null, 2));
+}
+
+function findSavedAsset(siteDir, requestedUrl, method = 'GET') {
+    const manifest = loadNetworkManifest(siteDir);
+    return findAssetEntry(manifest, requestedUrl, method);
+}
+
+function isImageManifestEntry(entry) {
+    if (!entry) return false;
+    const resourceType = String(entry.resourceType || '').toLowerCase();
+    if (resourceType === 'image') return true;
+    const contentType = String((entry.headers && (entry.headers['content-type'] || entry.headers['Content-Type'])) || '').toLowerCase();
+    return contentType.startsWith('image/');
+}
+
+function ensureImagesDir(siteDir) {
+    const imagesDir = path.join(siteDir, 'images');
+    fs.mkdirSync(imagesDir, { recursive: true });
+    return imagesDir;
+}
+
+function mirrorCapturedImages(siteDir, manifestEntries) {
+    const imagesDir = ensureImagesDir(siteDir);
+    let copied = 0;
+    const seen = new Set();
+
+    for (const entry of manifestEntries || []) {
+        if (!isImageManifestEntry(entry)) continue;
+        if (!entry.bodyPath || !fs.existsSync(entry.bodyPath)) continue;
+
+        let safeName = null;
+        try {
+            const parsed = new URL(entry.url);
+            const base = path.basename(parsed.pathname) || 'image';
+            const ext = path.extname(base) || extensionFromContentType((entry.headers && (entry.headers['content-type'] || entry.headers['Content-Type'])) || '') || '.img';
+            const stem = path.basename(base, path.extname(base)) || 'image';
+            const hash = crypto.createHash('sha1').update(entry.url).digest('hex').slice(0, 12);
+            safeName = `${stem}_${hash}${ext}`;
+        } catch (_) {
+            const hash = crypto.createHash('sha1').update(String(entry.url || entry.bodyPath)).digest('hex').slice(0, 12);
+            safeName = `image_${hash}.img`;
+        }
+
+        if (seen.has(safeName)) continue;
+        seen.add(safeName);
+
+        const target = path.join(imagesDir, safeName);
+        fs.cpSync(entry.bodyPath, target, { force: true });
+        copied += 1;
+    }
+
+    return { copied, dir: imagesDir };
+}
+
+function makeReplayProxyUrl(siteDir, rawUrl, method = 'GET') {
+    return `/replay-resource?sitePath=${encodeURIComponent(siteDir)}&url=${encodeURIComponent(rawUrl)}&method=${encodeURIComponent((method || 'GET').toUpperCase())}`;
+}
+
+function makeLocalAssetUrl(siteDir, rawUrl, method = 'GET') {
+    return `/asset?sitePath=${encodeURIComponent(siteDir)}&url=${encodeURIComponent(rawUrl)}&method=${encodeURIComponent((method || 'GET').toUpperCase())}`;
+}
+function escapeRegExp(text) {
+    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function rewriteHtmlToLocalAssets(html, siteDir) {
+    if (!ENABLE_LOCAL_REPLAY) return html;
+    const manifest = loadNetworkManifest(siteDir);
+    if (!manifest.length) return html;
+
+    let rewritten = html;
+    manifest.forEach((entry) => {
+        if (!entry || !entry.url || !entry.bodyPath) return;
+        const localUrl = `/asset?sitePath=${encodeURIComponent(siteDir)}&url=${encodeURIComponent(entry.url)}`;
+        rewritten = rewritten.replace(new RegExp(escapeRegExp(entry.url), 'g'), localUrl);
+    });
+
+    return rewritten;
+}
+
+function resolveBrowserExecutable() {
+    const candidates = [
+        process.env.PUPPETEER_EXECUTABLE_PATH,
+        '/usr/bin/chromium-browser',
+        '/usr/bin/chromium',
+        '/usr/bin/google-chrome',
+        '/usr/bin/google-chrome-stable'
+    ].filter(Boolean);
+
+    for (const candidate of candidates) {
+        if (fs.existsSync(candidate)) return candidate;
+    }
+
+    return null;
+}
+
+
 app.get('/events', (req, res) => {
     console.log('[SSE] Client connected to event stream.');
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
     req.socket.setNoDelay(true); // Disable Nagle's algorithm for immediate sending
     res.flushHeaders();
 
@@ -46,6 +797,13 @@ app.get('/events', (req, res) => {
     });
 });
 
+app.get('/events-poll', (req, res) => {
+    const sinceRaw = req.query.since;
+    const since = Number.isFinite(Number(sinceRaw)) ? Number(sinceRaw) : 0;
+    const events = eventHistory.filter((entry) => entry.id > since);
+    res.json({ latest: eventSeq, events });
+});
+
 
 app.get('/', (req, res) => {
     res.send(`
@@ -68,6 +826,7 @@ app.get('/', (req, res) => {
             <div id="navbar">
                 <input type="text" id="urlInput" placeholder="Enter full URL (e.g. site.com/game)">
                 <button id="loadButton">LOAD & SAVE</button>
+                <button id="updateButton">UPDATE PAGE</button>
                 <button class="download-button" onclick="downloadCurrentSite()">DOWNLOAD CURRENT</button>
                 <div id="status">Ready</div>
             </div>
@@ -76,66 +835,107 @@ app.get('/', (req, res) => {
             </div>
 
             <script>
-                const eventSource = new EventSource('/events');
-                eventSource.onmessage = function(event) {
-                    const data = JSON.parse(event.data);
-                    const status = document.getElementById('status');
-                    const iframe = document.getElementById('displayFrame');
-
-                    status.innerText = '📡 ' + data.message;
-                    if (data.type === 'complete' && data.html) {
-                        iframe.style.display = 'block';
-                        iframe.srcdoc = data.html;
-                        currentSitePath = data.sitePath; // Store for download
-                        status.innerText = data.fromCache ? "📁 [LOCAL] " + data.path : "🌐 [SAVED] " + data.path;
-
-                        window.onmessage = (e) => {
-                            if(e.data.type === 'navigate') loadGame(e.data.url);
-                        };
-                    } else if (data.type === 'error') {
-                        status.innerText = "❌ Error: " + data.message;
-                    }
-                };
-                eventSource.onerror = function(err) {
-                    console.error('EventSource failed:', err);
-                    document.getElementById('status').innerText = '❌ Lost connection to updates.';
-                };
+                let currentSitePath = null;
 
                 document.addEventListener('DOMContentLoaded', () => {
                     const loadButton = document.getElementById('loadButton');
+                    const updateButton = document.getElementById('updateButton');
                     loadButton.addEventListener('click', () => loadGame());
+                    updateButton.addEventListener('click', () => loadGame(undefined, true));
                 });
 
-                let currentSitePath = null;
+                function normalizeUrl(url) {
+                    return url.startsWith('http') ? url : ('https://' + url);
+                }
 
-                async function loadGame(targetUrl) {
+                function renderSavedSite(iframe, sitePath, originalUrl) {
+                    iframe.style.display = 'block';
+                    iframe.src = '/view-site?sitePath=' + encodeURIComponent(sitePath) + '&url=' + encodeURIComponent(normalizeUrl(originalUrl));
+                }
+
+                async function loadFromCacheOnly(url, status, iframe) {
+                    const cacheResponse = await fetch('/check-cache', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Accept': 'application/json',
+                            'ngrok-skip-browser-warning': 'true'
+                        },
+                        body: JSON.stringify({ url })
+                    });
+
+                    if (!cacheResponse.ok) {
+                        status.innerText = "❌ Cache check failed. Choose another site.";
+                        return false;
+                    }
+
+                    const cacheResult = await cacheResponse.json();
+                    if (cacheResult.hit && cacheResult.sitePath) {
+                        renderSavedSite(iframe, cacheResult.sitePath, url);
+                        currentSitePath = cacheResult.sitePath;
+                        status.innerText = "📁 [LOCAL] " + (cacheResult.path || '/');
+                        return true;
+                    }
+
+                    status.innerText = "ℹ️ No local save found. Starting capture...";
+                    return false;
+                }
+
+                async function loadGame(targetUrl, forceRefresh = false) {
                     const url = targetUrl || document.getElementById('urlInput').value;
                     if (!url) return;
                     if (targetUrl) document.getElementById('urlInput').value = targetUrl;
-                    
+
                     const status = document.getElementById('status');
                     const iframe = document.getElementById('displayFrame');
 
-                    status.innerText = "⏳ Requesting capture...";
+                    status.innerText = forceRefresh ? "🔄 Updating page..." : "⏳ Checking saved cache...";
                     iframe.style.display = "none";
-                    currentSitePath = null; // Reset on new load
+                    currentSitePath = null;
 
                     try {
-                        // Send a non-blocking request to start capture
-                        const response = await fetch('/capture-start', {
+                        if (!navigator.onLine) {
+                            if (forceRefresh) {
+                                status.innerText = "ℹ️ Offline mode: cannot update right now. Choose another site or reconnect.";
+                                return;
+                            }
+                            const loadedCached = await loadFromCacheOnly(url, status, iframe);
+                            if (!loadedCached) {
+                                status.innerText = "ℹ️ Offline and no saved copy exists yet. Connect to WiFi and load once to save it.";
+                            }
+                            return;
+                        }
+
+                        status.innerText = forceRefresh
+                            ? "🔄 Updating from web and resaving..."
+                            : "⏳ Loading from WiFi/web first, then saving local copy...";
+                        const response = await fetch('/capture', {
                             method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ url })
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Accept': 'application/json',
+                                'ngrok-skip-browser-warning': 'true'
+                            },
+                            body: JSON.stringify({ url, forceRefresh })
                         });
-                        const result = await response.json();
-                        if (result.status === 'started') {
-                            status.innerText = "📡 Server is capturing...";
-                            // Further updates will come via SSE
-                        } else {
-                            status.innerText = "❌ Server failed to start capture: " + (result.message || 'Unknown error');
+
+                        const data = await response.json();
+                        if (!response.ok) {
+                            status.innerText = "❌ Error: " + (data.error || ('HTTP ' + response.status));
+                            return;
+                        }
+
+                        if (data.sitePath) {
+                            status.innerText = data.fromCache ? "📁 [LOCAL] " + data.path : "🌐 [SAVED] " + data.path;
+                            renderSavedSite(iframe, data.sitePath, url);
+                            currentSitePath = data.sitePath;
+
+                            window.onmessage = (e) => {
+                                if (e.data.type === 'navigate') loadGame(e.data.url);
+                            };
                         }
                     } catch (err) {
-                        status.innerText = "❌ Client error: " + err.message;
+                        status.innerText = "❌ Error: " + err.message;
                     }
                 }
 
@@ -152,13 +952,32 @@ app.get('/', (req, res) => {
     `);
 });
 
+app.get('/view-site', (req, res) => {
+    const sitePath = req.query.sitePath;
+    if (!isSafeSitePath(sitePath)) {
+        return res.status(400).send('Invalid site path.');
+    }
+
+    const siteFile = path.join(sitePath, 'index.html');
+    if (!fs.existsSync(siteFile)) {
+        return res.status(404).send('Saved page not found.');
+    }
+
+    const savedHtml = fs.readFileSync(siteFile, 'utf8');
+    const originalUrl = typeof req.query.url === 'string' ? req.query.url : null;
+    const preparedReplayHtml = prepareHtmlForOfflineReplay(savedHtml, sitePath, originalUrl);
+    const preparedHtml = injectBaseHref(preparedReplayHtml, originalUrl);
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.send(preparedHtml);
+});
+
 // New route to download the currently viewed site as a zip file
 app.get('/download-current-site', async (req, res) => {
     const sitePath = req.query.sitePath;
     console.log(`[DOWNLOAD] Request to download site from: ${sitePath}`);
 
     // Security: Ensure the path is within the STORAGE_DIR
-    if (!sitePath || !sitePath.startsWith(STORAGE_DIR) || sitePath.includes('..')) {
+    if (!isSafeSitePath(sitePath)) {
         console.error(`[DOWNLOAD] Invalid site path attempted: ${sitePath}`);
         return res.status(400).send('Invalid site path.');
     }
@@ -196,6 +1015,104 @@ app.get('/download-current-site', async (req, res) => {
     });
 });
 
+app.all('/replay-resource', async (req, res) => {
+    const sitePath = req.query.sitePath;
+    const requestedUrl = req.query.url;
+    const method = (req.query.method || req.method || 'GET').toUpperCase();
+
+    if (!isSafeSitePath(sitePath) || !requestedUrl) {
+        console.warn(`[REPLAY] Invalid request. sitePath=${sitePath} url=${requestedUrl}`);
+        return res.status(400).send('Invalid replay request.');
+    }
+
+    console.log(`[REPLAY] ${method} ${requestedUrl}`);
+
+    if (shouldBlockRequestUrl(requestedUrl, new URL(requestedUrl).hostname)) {
+        console.log(`[REPLAY] Blocked by policy: ${requestedUrl}`);
+        return res.status(204).end();
+    }
+
+    const cached = findSavedAsset(sitePath, requestedUrl, method);
+    if (cached && cached.bodyPath && fs.existsSync(cached.bodyPath)) {
+        const resolved = path.resolve(cached.bodyPath);
+        if (!resolved.startsWith(sitePath)) return res.status(400).send('Invalid cached path.');
+        const contentType = cached.headers && (cached.headers['content-type'] || cached.headers['Content-Type']);
+        if (contentType) res.setHeader('Content-Type', contentType);
+        console.log(`[REPLAY] HIT ${method} ${requestedUrl} -> ${resolved}`);
+        return res.sendFile(resolved);
+    }
+
+    console.warn(`[REPLAY] MISS ${method} ${requestedUrl} (attempting network fetch)`);
+
+    try {
+        const response = await fetch(requestedUrl, { method: method === 'GET' ? 'GET' : method });
+        const buf = Buffer.from(await response.arrayBuffer());
+        const networkDir = path.join(sitePath, 'network_assets');
+        const responseContentType = response.headers.get('content-type') || '';
+        const bodyPath = getAssetStoragePathForUrl(networkDir, requestedUrl, responseContentType);
+        await fs.promises.mkdir(path.dirname(bodyPath), { recursive: true });
+        await fs.promises.writeFile(bodyPath, buf);
+
+        const headers = {};
+        response.headers.forEach((v, k) => { headers[k] = v; });
+        upsertManifestEntry(sitePath, {
+            url: requestedUrl,
+            method,
+            resourceType: 'replay',
+            status: response.status,
+            headers,
+            timestamp: new Date().toISOString(),
+            bodyPath,
+            bodySize: buf.length
+        });
+
+        if (String(headers['content-type'] || '').toLowerCase().startsWith('image/')) {
+            mirrorCapturedImages(sitePath, [{ url: requestedUrl, headers, resourceType: 'image', bodyPath }]);
+        }
+
+        const contentType = headers['content-type'];
+        if (contentType) res.setHeader('Content-Type', contentType);
+        console.log(`[REPLAY] FETCHED ${method} ${requestedUrl} status=${response.status} bytes=${buf.length}`);
+        return res.status(response.status).send(buf);
+    } catch (error) {
+        console.error(`[REPLAY] FETCH FAILED ${method} ${requestedUrl}: ${error.message}`);
+        return res.status(502).json({
+            error: 'Replay fetch failed',
+            message: error.message,
+            url: requestedUrl,
+            method,
+            hint: 'Asset was not captured and network fetch failed (often due to offline mode). Re-capture while online.'
+        });
+    }
+});
+
+app.get('/asset', (req, res) => {
+    const sitePath = req.query.sitePath;
+    const requestedUrl = req.query.url;
+
+    if (!isSafeSitePath(sitePath) || !requestedUrl) {
+        return res.status(400).send('Invalid asset request.');
+    }
+
+    const manifest = loadNetworkManifest(sitePath);
+    const assetEntry = findAssetEntry(manifest, requestedUrl, req.query.method || 'GET');
+
+    if (!assetEntry) {
+        console.warn(`[ASSET] MISS ${requestedUrl}`);
+        return res.status(404).send('Asset not found.');
+    }
+
+    const resolvedAssetPath = path.resolve(assetEntry.bodyPath);
+    if (!resolvedAssetPath.startsWith(sitePath)) {
+        return res.status(400).send('Invalid asset path.');
+    }
+
+    const contentType = assetEntry.headers && (assetEntry.headers['content-type'] || assetEntry.headers['Content-Type']);
+    if (contentType) res.setHeader('Content-Type', contentType);
+    console.log(`[ASSET] HIT ${requestedUrl} -> ${resolvedAssetPath}`);
+    return res.sendFile(resolvedAssetPath);
+});
+
 // DEPRECATED: This route downloads all saved sites.
 app.get('/download-all-sites-DEPRECATED', async (req, res) => {
     const zipFileName = 'saved_sites.zip';
@@ -228,81 +1145,232 @@ app.get('/download-all-sites-DEPRECATED', async (req, res) => {
 });
 
 
+app.post('/check-cache', (req, res) => {
+    try {
+        const targetUrl = req.body.url;
+        if (!targetUrl) return res.status(400).json({ hit: false, message: 'Missing url.' });
+
+        const { normalizedUrl, urlObj, siteDir, siteFile } = buildSitePaths(targetUrl);
+        const hit = fs.existsSync(siteFile);
+
+        if (!hit) return res.json({ hit: false });
+
+        const pageVersion = String(fs.statSync(siteFile).mtimeMs);
+        return res.json({ hit: true, sitePath: siteDir, path: urlObj.pathname, pageVersion, originalUrl: normalizedUrl });
+    } catch (error) {
+        return res.status(400).json({ hit: false, message: error.message });
+    }
+});
+
+app.post('/capture', async (req, res) => {
+    let targetUrl = req.body.url;
+    const forceRefresh = Boolean(req.body.forceRefresh);
+
+    try {
+        const { normalizedUrl, urlObj, siteDir, siteFile } = buildSitePaths(targetUrl);
+        targetUrl = normalizedUrl;
+        ensureImagesDir(siteDir);
+
+        if (fs.existsSync(siteFile) && !forceRefresh) {
+            ensureImagesDir(siteDir);
+            const existingManifest = loadNetworkManifest(siteDir);
+            const hasSnapshot = fs.existsSync(path.join(siteDir, 'snapshot.mhtml'));
+            if (existingManifest.length > 0 || hasSnapshot) {
+                mirrorCapturedImages(siteDir, existingManifest);
+                const savedHtml = fs.readFileSync(siteFile, 'utf8');
+                return res.json({ html: savedHtml, fromCache: true, path: urlObj.pathname, sitePath: siteDir });
+            }
+            console.warn(`[CAPTURE] Cache exists but missing dependencies for ${targetUrl}; recapturing.`);
+        }
+
+        let browser;
+        let userDataDir = null;
+        try {
+            const executablePath = resolveBrowserExecutable();
+            userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dol-puppeteer-profile-'));
+            const launchOptions = {
+                headless: true,
+                userDataDir,
+                args: ['--disable-web-security', '--no-sandbox', '--disable-setuid-sandbox']
+            };
+            if (executablePath) launchOptions.executablePath = executablePath;
+
+            browser = await puppeteer.launch(launchOptions);
+            const page = await browser.newPage();
+            await page.setCacheEnabled(false);
+            await applyRequestPolicy(page, urlObj.hostname);
+            const networkDir = path.join(siteDir, 'network_assets');
+            const networkCapture = setupNetworkCapture(page, networkDir);
+            await page.setBypassCSP(true);
+            console.log(`[CAPTURE] Navigating with timeout=${CAPTURE_NAV_TIMEOUT_MS}ms url=${targetUrl}`);
+            await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: CAPTURE_NAV_TIMEOUT_MS });
+            console.log(`[CAPTURE] Warmup for ${CAPTURE_WARMUP_MS}ms url=${targetUrl}`);
+            await warmupPageForOfflineCapture(page, CAPTURE_WARMUP_MS, () => networkCapture.getCapturedCount());
+            await prefetchCriticalResources(page);
+
+            const gameData = await page.evaluate(() => {
+                document.querySelectorAll('a').forEach(link => {
+                    link.onclick = (e) => {
+                        e.preventDefault();
+                        window.parent.postMessage({type: 'navigate', url: link.href}, '*');
+                    };
+                });
+                return document.documentElement.outerHTML;
+            });
+
+            let snapshotData = null;
+            try {
+                const cdpSession = await page.target().createCDPSession();
+                await cdpSession.send('Page.enable');
+                const snapshot = await cdpSession.send('Page.captureSnapshot', { format: 'mhtml' });
+                snapshotData = snapshot.data;
+            } catch (snapshotError) {
+                console.warn('[WARN] /capture snapshot unavailable:', snapshotError.message);
+            }
+
+            const capturedRequests = await networkCapture.finalize();
+            const networkManifestFile = path.join(siteDir, 'network_manifest.json');
+            if (!fs.existsSync(siteDir)) fs.mkdirSync(siteDir, { recursive: true });
+            fs.writeFileSync(siteFile, gameData);
+            if (snapshotData) fs.writeFileSync(path.join(siteDir, 'snapshot.mhtml'), snapshotData);
+
+            let existingManifest = [];
+            if (fs.existsSync(networkManifestFile)) {
+                try {
+                    existingManifest = JSON.parse(fs.readFileSync(networkManifestFile, 'utf8'));
+                    if (!Array.isArray(existingManifest)) existingManifest = [];
+                } catch (error) {
+                    existingManifest = [];
+                }
+            }
+            const mergedManifest = mergeNetworkManifests(existingManifest, capturedRequests);
+            fs.writeFileSync(networkManifestFile, JSON.stringify(mergedManifest, null, 2));
+            const mirroredImages = mirrorCapturedImages(siteDir, mergedManifest);
+
+            const savedBodies = capturedRequests.filter((entry) => entry.bodyPath).length;
+            const failedRequests = capturedRequests.filter((entry) => entry.failed).length;
+            const imageEntries = capturedRequests.filter((entry) => String(entry.resourceType || '').toLowerCase() === 'image' || String((entry.headers && (entry.headers['content-type'] || entry.headers['Content-Type'])) || '').toLowerCase().startsWith('image/')).length;
+            console.log(`[CAPTURE] Completed ${targetUrl} | captured=${capturedRequests.length} savedBodies=${savedBodies} images=${imageEntries} failed=${failedRequests} manifestTotal=${mergedManifest.length} mirroredImages=${mirroredImages.copied}`);
+
+            await browser.close();
+            browser = null;
+            persistChromiumCache(userDataDir, siteDir);
+            fs.rmSync(userDataDir, { recursive: true, force: true });
+
+            return res.json({ html: gameData, fromCache: false, path: urlObj.pathname, sitePath: siteDir });
+        } catch (error) {
+            if (browser) await browser.close();
+            if (typeof userDataDir === 'string') {
+                persistChromiumCache(userDataDir, siteDir);
+                fs.rmSync(userDataDir, { recursive: true, force: true });
+            }
+            return res.status(500).json({ error: error.message });
+        }
+    } catch (error) {
+        return res.status(400).json({ error: error.message });
+    }
+});
+
 // New endpoint to start the capture process in the background
 app.post('/capture-start', (req, res) => {
     const targetUrl = req.body.url;
-    console.log(`[API] /capture-start endpoint hit for URL: ${targetUrl}`);
+    const requestId = req.body.requestId || null;
+    const forceRefresh = Boolean(req.body.forceRefresh);
+    console.log(`[API] /capture-start endpoint hit for URL: ${targetUrl} (forceRefresh=${forceRefresh})`);
 
     // Immediately respond to the client that the capture has started
     res.json({ status: 'started', message: 'Capture process initiated.' });
 
     // Launch the capture process in the background
     setImmediate(async () => {
-        await captureSite(targetUrl);
+        await captureSite(targetUrl, requestId, forceRefresh);
     });
 });
 
-async function captureSite(targetUrl) {
+async function captureSite(targetUrl, requestId = null, forceRefresh = false) {
     console.log(`[CAPTURE] captureSite function started for URL: ${targetUrl}`);
-    sseEvents.emit('update', { type: 'status', message: `Starting capture for ${targetUrl}...` });
+    publishUpdate( { type: 'status', requestId, message: `Starting capture for ${targetUrl}...` });
 
-    if (!targetUrl.startsWith('http')) targetUrl = 'https://' + targetUrl;
-    
-    const urlObj = new URL(targetUrl);
-    
-    const safeHostname = urlObj.hostname.replace(/[^a-z0-9]/gi, '_');
-    const safePath = urlObj.pathname.replace(/[^a-z0-9]/gi, '_');
-    const siteDir = path.join(STORAGE_DIR, safeHostname, safePath);
-    const siteFile = path.join(siteDir, 'index.html');
+    const { normalizedUrl, urlObj, siteDir, siteFile } = buildSitePaths(targetUrl);
+    targetUrl = normalizedUrl;
+    ensureImagesDir(siteDir);
+    const snapshotFile = path.join(siteDir, 'snapshot.mhtml');
 
-    // 1. Check if this specific page exists
-    sseEvents.emit('update', { type: 'status', message: `Checking cache for ${targetUrl}...` });
-    if (fs.existsSync(siteFile)) {
-        console.log(`[LOCAL] Loading from: ${siteFile}`);
-        sseEvents.emit('update', { type: 'status', message: `Loading from cache: ${siteFile}` });
-        const savedHtml = fs.readFileSync(siteFile, 'utf8');
-        sseEvents.emit('update', { type: 'complete', html: savedHtml, fromCache: true, path: urlObj.pathname, sitePath: siteDir, message: `Loaded from cache: ${urlObj.pathname}` });
+    const hasCachedHtml = fs.existsSync(siteFile);
+    let cachedHtml = null;
+    if (hasCachedHtml && !forceRefresh) {
+        cachedHtml = fs.readFileSync(siteFile, 'utf8');
+        const cachedPageVersion = String(fs.statSync(siteFile).mtimeMs);
+        publishUpdate( { type: 'complete', requestId, fromCache: true, path: urlObj.pathname, sitePath: siteDir, originalUrl: targetUrl, pageVersion: cachedPageVersion, message: `Loaded from saved cache: ${urlObj.pathname}` });
+        publishUpdate( { type: 'status', requestId, message: 'Using saved site (browser refresh skipped).' });
         return;
     }
 
-    // 2. Otherwise, download it
+    if (hasCachedHtml && forceRefresh) {
+        publishUpdate( { type: 'status', requestId, message: 'Forced refresh requested: recapturing page and assets.' });
+    }
+    publishUpdate( { type: 'status', requestId, message: `Fetching new page: ${targetUrl}` });
     console.log(`[FETCH] Capturing new page: ${targetUrl}`);
-    sseEvents.emit('update', { type: 'status', message: `Fetching new page: ${targetUrl}` });
     let browser;
+    let userDataDir = null;
     try {
-        sseEvents.emit('update', { type: 'status', message: 'Launching browser...' });
+        publishUpdate( { type: 'status', requestId, message: 'Launching browser...' });
         console.log('[LOG] Launching browser...');
-        browser = await puppeteer.launch({ 
-            headless: true, 
-            executablePath: '/usr/bin/chromium-browser', // Specify the path to the system Chromium
+        const executablePath = resolveBrowserExecutable();
+        userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dol-puppeteer-profile-'));
+        const launchOptions = {
+            headless: true,
+            userDataDir,
             args: [
                 '--disable-web-security',
                 '--no-sandbox', // Required for Docker/some Linux environments
                 '--disable-setuid-sandbox' // Required for Docker/some Linux environments
-            ] 
-        });
-        console.log('[LOG] Browser launched.');
-        sseEvents.emit('update', { type: 'status', message: 'Browser launched.' });
+            ]
+        };
 
-        sseEvents.emit('update', { type: 'status', message: 'Creating new page...' });
+        if (executablePath) {
+            launchOptions.executablePath = executablePath;
+            console.log(`[LOG] Using browser executable at ${executablePath}`);
+            publishUpdate( { type: 'status', requestId, message: `Using browser executable at ${executablePath}` });
+        } else {
+            console.log('[LOG] No system Chromium found, using Puppeteer default executable resolution.');
+            publishUpdate( { type: 'status', requestId, message: 'No system Chromium found, using Puppeteer default executable.' });
+        }
+
+        browser = await puppeteer.launch(launchOptions);
+        console.log('[LOG] Browser launched.');
+        publishUpdate( { type: 'status', requestId, message: 'Browser launched.' });
+
+        publishUpdate( { type: 'status', requestId, message: 'Creating new page...' });
         const page = await browser.newPage();
         console.log('[LOG] New page created.');
-        sseEvents.emit('update', { type: 'status', message: 'New page created.' });
+        publishUpdate( { type: 'status', requestId, message: 'New page created.' });
 
-        sseEvents.emit('update', { type: 'status', message: 'Bypassing CSP...' });
+        await page.setCacheEnabled(false);
+        await applyRequestPolicy(page, urlObj.hostname);
+        const networkDir = path.join(siteDir, 'network_assets');
+        const networkCapture = setupNetworkCapture(page, networkDir);
+        publishUpdate( { type: 'status', requestId, message: 'Network capture enabled (saving all requested assets).' });
+
+        publishUpdate( { type: 'status', requestId, message: 'Bypassing CSP...' });
         await page.setBypassCSP(true);
         console.log('[LOG] Bypassing CSP.');
-        sseEvents.emit('update', { type: 'status', message: 'CSP bypassed.' });
+        publishUpdate( { type: 'status', requestId, message: 'CSP bypassed.' });
 
 
-        sseEvents.emit('update', { type: 'status', message: `Navigating to ${targetUrl}...` });
+        publishUpdate( { type: 'status', requestId, message: `Navigating to ${targetUrl}...` });
         console.log(`[LOG] Navigating to ${targetUrl}...`);
-        await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+        console.log(`[CAPTURE] Navigating with timeout=${CAPTURE_NAV_TIMEOUT_MS}ms url=${targetUrl}`);
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: CAPTURE_NAV_TIMEOUT_MS });
+        publishUpdate( { type: 'status', requestId, message: `Running deep warmup (${CAPTURE_WARMUP_MS}ms) to trigger lazy game assets...` });
+        console.log(`[CAPTURE] Warmup for ${CAPTURE_WARMUP_MS}ms url=${targetUrl}`);
+        await warmupPageForOfflineCapture(page, CAPTURE_WARMUP_MS, () => networkCapture.getCapturedCount());
+        await prefetchCriticalResources(page);
         console.log('[LOG] Navigation complete.');
-        sseEvents.emit('update', { type: 'status', message: 'Navigation complete.' });
+        publishUpdate( { type: 'status', requestId, message: 'Navigation complete.' });
 
 
-        sseEvents.emit('update', { type: 'status', message: 'Evaluating page content...' });
+        publishUpdate( { type: 'status', requestId, message: 'Evaluating page content...' });
         const gameData = await page.evaluate(() => {
             // Hijack links to keep them in our system
             document.querySelectorAll('a').forEach(link => {
@@ -314,31 +1382,88 @@ async function captureSite(targetUrl) {
             return document.documentElement.outerHTML;
         });
         console.log('[LOG] Page evaluated.');
-        sseEvents.emit('update', { type: 'status', message: 'Page content evaluated.' });
+        publishUpdate( { type: 'status', requestId, message: 'Page content evaluated.' });
+
+        publishUpdate( { type: 'status', requestId, message: 'Capturing full page snapshot (including iframe content)...' });
+        let snapshotData = null;
+        try {
+            const cdpSession = await page.target().createCDPSession();
+            await cdpSession.send('Page.enable');
+            const snapshot = await cdpSession.send('Page.captureSnapshot', { format: 'mhtml' });
+            snapshotData = snapshot.data;
+            console.log('[LOG] Full MHTML snapshot captured.');
+            publishUpdate( { type: 'status', requestId, message: 'Full page snapshot captured.' });
+        } catch (snapshotError) {
+            console.warn('[WARN] MHTML snapshot failed, continuing without snapshot.mhtml:', snapshotError.message);
+            publishUpdate( { type: 'status', requestId, message: `MHTML snapshot unavailable (${snapshotError.message}). Continuing...` });
+        }
+
+        publishUpdate( { type: 'status', requestId, message: 'Finalizing network asset capture...' });
+        const capturedRequests = await networkCapture.finalize();
+        const networkManifestFile = path.join(siteDir, 'network_manifest.json');
 
 
         // Ensure directories exist and save
-        sseEvents.emit('update', { type: 'status', message: `Ensuring directory exists: ${siteDir}` });
+        publishUpdate( { type: 'status', requestId, message: `Ensuring directory exists: ${siteDir}` });
         if (!fs.existsSync(siteDir)) fs.mkdirSync(siteDir, { recursive: true });
-        sseEvents.emit('update', { type: 'status', message: `Saving site to ${siteFile}` });
-        fs.writeFileSync(siteFile, gameData);
-        console.log(`[LOG] Site saved to ${siteFile}`);
-        sseEvents.emit('update', { type: 'status', message: `Site saved to ${siteFile}` });
 
-        sseEvents.emit('update', { type: 'status', message: 'Closing browser...' });
+        const htmlToStore = hasCachedHtml && cachedHtml ? cachedHtml : gameData;
+        if (!hasCachedHtml) {
+            publishUpdate( { type: 'status', requestId, message: `Saving site to ${siteFile}` });
+            fs.writeFileSync(siteFile, htmlToStore);
+        } else {
+            publishUpdate( { type: 'status', requestId, message: 'Keeping cached HTML and updating dependency files only.' });
+        }
+
+        if (snapshotData) fs.writeFileSync(snapshotFile, snapshotData);
+
+        let existingManifest = [];
+        if (fs.existsSync(networkManifestFile)) {
+            try {
+                existingManifest = JSON.parse(fs.readFileSync(networkManifestFile, 'utf8'));
+                if (!Array.isArray(existingManifest)) existingManifest = [];
+            } catch (error) {
+                existingManifest = [];
+            }
+        }
+
+        const mergedManifest = mergeNetworkManifests(existingManifest, capturedRequests);
+        fs.writeFileSync(networkManifestFile, JSON.stringify(mergedManifest, null, 2));
+        const mirroredImages = mirrorCapturedImages(siteDir, mergedManifest);
+
+        const savedBodies = capturedRequests.filter((entry) => entry.bodyPath).length;
+        const failedRequests = capturedRequests.filter((entry) => entry.failed).length;
+        const imageEntries = capturedRequests.filter((entry) => String(entry.resourceType || '').toLowerCase() === 'image' || String((entry.headers && (entry.headers['content-type'] || entry.headers['Content-Type'])) || '').toLowerCase().startsWith('image/')).length;
+        console.log(`[CAPTURE] Background completed ${targetUrl} | captured=${capturedRequests.length} savedBodies=${savedBodies} images=${imageEntries} failed=${failedRequests} manifestTotal=${mergedManifest.length} mirroredImages=${mirroredImages.copied}`);
+        console.log(`[LOG] Dependency refresh complete for ${siteFile}`);
+        publishUpdate( { type: 'status', requestId, message: `Dependencies refreshed (${capturedRequests.length} new requests, ${mergedManifest.length} total tracked).` });
+
+        publishUpdate( { type: 'status', requestId, message: 'Closing browser...' });
         await browser.close();
+        browser = null;
+        persistChromiumCache(userDataDir, siteDir);
+        fs.rmSync(userDataDir, { recursive: true, force: true });
         console.log('[LOG] Browser closed.');
-        sseEvents.emit('update', { type: 'status', message: 'Browser closed.' });
+        publishUpdate( { type: 'status', requestId, message: 'Browser closed.' });
 
 
-        sseEvents.emit('update', { type: 'complete', html: gameData, fromCache: false, path: urlObj.pathname, sitePath: siteDir, message: `Page captured: ${urlObj.pathname}` });
+        if (!hasCachedHtml) {
+            const savedPageVersion = String(fs.statSync(siteFile).mtimeMs);
+            publishUpdate( { type: 'complete', requestId, fromCache: false, path: urlObj.pathname, sitePath: siteDir, originalUrl: targetUrl, pageVersion: savedPageVersion, message: `Page captured with ${capturedRequests.length} assets: ${urlObj.pathname}` });
+        } else {
+            publishUpdate( { type: 'status', requestId, message: `Dependency refresh complete for cached page: ${urlObj.pathname}` });
+        }
 
     } catch (error) {
         console.error('[ERROR] An error occurred during capture:', error);
-        sseEvents.emit('update', { type: 'error', message: `Capture failed: ${error.message}` });
+        publishUpdate( { type: 'error', requestId, message: `Capture failed: ${error.message}` });
         if (browser) {
-            sseEvents.emit('update', { type: 'status', message: 'Closing browser due to error...' });
+            publishUpdate( { type: 'status', requestId, message: 'Closing browser due to error...' });
             await browser.close();
+        }
+        if (typeof userDataDir === 'string') {
+            persistChromiumCache(userDataDir, siteDir);
+            fs.rmSync(userDataDir, { recursive: true, force: true });
         }
     }
 }
