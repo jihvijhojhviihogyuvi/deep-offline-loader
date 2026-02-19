@@ -2,6 +2,17 @@
 
 This project is a web application that allows you to download and archive websites for offline viewing. It uses Node.js, Express, and Puppeteer to capture the full HTML of a given URL and all its assets.
 
+It saves the page HTML as captured (without rewriting iframe `src` to `srcdoc`) and also saves a full-page `snapshot.mhtml` using Chrome's `Page.captureSnapshot` as a fallback artifact.
+
+Each capture now refreshes dependency downloads (cache disabled during capture) and records every HTTP(S) response requested during that run into `network_assets/` plus a `network_manifest.json`. When loading from saved HTML, known captured remote URLs are rewritten to local `/asset` URLs, and an offline replay shim rewrites runtime `fetch`/XHR/beacon requests to local assets too, while cached `index.html` remains unchanged on disk.
+
+Capture launches now use an isolated temporary Chromium profile per run to avoid `userDataDir` lock conflicts when multiple captures are started close together.
+
+For tunnel/proxy setups (such as ngrok), capture start requests now send `ngrok-skip-browser-warning: true` and the UI gracefully handles non-JSON HTML tunnel responses instead of crashing with `Unexpected token "<"`.
+SSE responses now set anti-buffering headers and the UI safely ignores non-JSON SSE payloads, which improves reliability when traversing mobile proxies/tunnels.
+When a page is marked complete, the app now loads it through local `/view-site` rendering (instead of depending on huge HTML blobs in SSE), which is more tunnel-friendly on mobile.
+The frontend now falls back to `/events-poll` long-polling when SSE is blocked by a tunnel/proxy, and immediately starts polling updates on capture start to avoid first-attempt stalls over ngrok/mobile networks.
+
 ## How to Run
 
 1.  **Install Dependencies:**
@@ -388,3 +399,21 @@ async function captureSite(targetUrl) {
 app.listen(port, () => {
     console.log(`🚀 Deep Downloader: http://localhost:${port}`);
 });
+
+Note: local replay URL/script rewriting is enabled by default (`ENABLE_LOCAL_REPLAY = true`).
+
+MHTML snapshot capture is best-effort; if `Page.captureSnapshot` fails on a site/browser build, capture continues and still saves HTML plus network assets.
+
+The viewer now tracks a page version and will not reload the iframe for duplicate `complete` updates unless the saved page content actually changed.
+
+Using saved cache now skips browser recapture by default, so opening an already-downloaded site does not relaunch Chromium unless cache is missing.
+
+UI now includes an `UPDATE PAGE` button that forces a recapture even when a saved cache exists; regular `LOAD & SAVE` uses cached page immediately when available.
+
+Normal `LOAD & SAVE` now checks `/check-cache` first and directly opens `/view-site` for saved pages without starting a capture job, so cached pages stay stable and do not switch to background update flow unless you press `UPDATE PAGE`.
+
+Cached `/view-site` rendering now injects a `<base href="...">` (from the original page URL) so relative script/style/image paths resolve correctly instead of rendering a blank page.
+
+When loading from cache, SSE fallback notices no longer overwrite the local-loaded status, so cached pages remain marked as local even if EventSource drops.
+
+While viewing a cached page, background/polled capture events are ignored unless a new capture is explicitly started, preventing unwanted recapture UI churn.
